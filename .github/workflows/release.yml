@@ -178,9 +178,18 @@ jobs:
           APP_PATH="src-tauri/target/release/bundle/macos/Nova.app"
           ENTITLEMENTS="src-tauri/entitlements.plist"
 
-          for bin in docker colima limactl; do
+          # docker only needs basic signature (no special entitlements)
+          if [ -f "$APP_PATH/Contents/Resources/resources/bin/docker" ]; then
+            codesign --force --options runtime --timestamp --sign "$CERT" \
+              "$APP_PATH/Contents/Resources/resources/bin/docker"
+          fi
+
+          # limactl needs virtualization entitlement - it calls Virtualization.framework
+          # colima also needs it as it invokes limactl which creates VZ VMs
+          for bin in colima limactl; do
             if [ -f "$APP_PATH/Contents/Resources/resources/bin/$bin" ]; then
               codesign --force --options runtime --timestamp --sign "$CERT" \
+                --entitlements "$ENTITLEMENTS" \
                 "$APP_PATH/Contents/Resources/resources/bin/$bin"
             fi
           done

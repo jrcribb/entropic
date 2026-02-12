@@ -107,6 +107,25 @@ LIMA_WRAPPER
 
     rm -rf "$LIMA_TMP"
 
+    # Clean up guest agents:
+    # 1. Remove .gz duplicates (Lima warns "multiple files found" if both exist)
+    # 2. Keep only the target architecture to reduce bundle size (~46MB each)
+    echo "Cleaning up Lima guest agents for ${ARCH_NORMALIZED}..."
+    # Remove all .gz versions (Lima can use the uncompressed ones directly)
+    rm -f "$RESOURCES_BASE/share/lima/lima-guestagent."*.gz
+    # Remove guest agents for other architectures
+    for agent in "$RESOURCES_BASE/share/lima/lima-guestagent."*; do
+        case "$agent" in
+            *".Linux-${ARCH_NORMALIZED}") ;; # keep target arch
+            *) echo "  Removing $(basename "$agent")" && rm -f "$agent" ;;
+        esac
+    done
+    echo "Remaining guest agents:"
+    ls -la "$RESOURCES_BASE/share/lima/lima-guestagent."* 2>/dev/null || true
+
+    # Remove examples directory (not needed at runtime, saves ~1MB)
+    rm -rf "$RESOURCES_BASE/share/lima/examples"
+
     # Download Docker CLI (static binary)
     # Docker provides static builds at https://download.docker.com/mac/static/stable/
     DOCKER_VERSION="27.5.1"
