@@ -116,18 +116,16 @@ LIMA_WRAPPER
     rm -rf "$LIMA_TMP"
 
     # Clean up guest agents:
-    # 1. Remove .gz duplicates (Lima warns "multiple files found" if both exist)
-    # 2. Keep only the target architecture to reduce bundle size (~46MB each)
+    # Keep only the target architecture to reduce bundle size (~46MB each)
+    # Lima may ship .gz or uncompressed versions - handle both
     echo "Cleaning up Lima guest agents for ${ARCH_NORMALIZED}..."
-    # Remove all .gz versions (Lima can use the uncompressed ones directly)
-    rm -f "$RESOURCES_BASE/share/lima/lima-guestagent."*.gz
-    # Remove guest agents for other architectures
     shopt -s nullglob  # Don't expand to literal string if no matches
     for agent in "$RESOURCES_BASE/share/lima/lima-guestagent."*; do
         case "$agent" in
-            *".Linux-${ARCH_NORMALIZED}")
+            *".Linux-${ARCH_NORMALIZED}"*)
+                # Keep target arch (matches both .gz and uncompressed)
                 echo "  Keeping: $(basename "$agent")"
-                ;; # keep target arch
+                ;;
             *)
                 echo "  Removing: $(basename "$agent")"
                 rm -f "$agent"
