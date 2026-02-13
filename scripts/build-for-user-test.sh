@@ -4,7 +4,13 @@ set -e
 echo "🏗️  Building Nova for end-user testing..."
 echo ""
 
-cd "$(dirname "$0")"
+# Change to project root (parent of scripts directory)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+cd "$PROJECT_ROOT"
+
+echo "📁 Working directory: $PROJECT_ROOT"
+echo ""
 
 # ============================================
 # 0. PRE-FLIGHT CHECK: DOCKER RUNNING?
@@ -97,7 +103,7 @@ echo "🐳 Building OpenClaw runtime image..."
 
 # Pass the found location to the build script
 export OPENCLAW_SOURCE
-./scripts/build-openclaw-runtime.sh
+"$PROJECT_ROOT/scripts/build-openclaw-runtime.sh"
 
 echo "✅ OpenClaw runtime image built"
 
@@ -117,7 +123,7 @@ echo "   (ignoring code signing warnings - not needed for testing)"
 echo ""
 
 # Run build script, ignore signing errors (exit code 1 from signing)
-./scripts/build-cross-platform.sh || {
+"$PROJECT_ROOT/scripts/build-cross-platform.sh" || {
     # Check if the app was actually built despite the signing error
     if [ ! -d "src-tauri/target/release/bundle/macos/Nova.app" ]; then
         echo ""
