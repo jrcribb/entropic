@@ -12,11 +12,17 @@ import {
   Clock,
   Puzzle,
   Sparkles,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Minus,
+  Square,
+  X,
 } from "lucide-react";
 import novaLogo from "../assets/nova-logo.png";
 import type { ChatSession } from "../pages/Chat";
 import clsx from "clsx";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { platform } from "@tauri-apps/plugin-os";
 import { loadProfile, type AgentProfile } from "../lib/profile";
 
 function startDrag(e: React.MouseEvent) {
@@ -68,6 +74,8 @@ function sessionTitle(s: ChatSession): string {
 
 export function Layout({ currentPage, onNavigate, children, gatewayRunning, integrationsSyncing, chatSessions, currentChatSession, onSelectChatSession, onNewChat }: Props) {
   const [profile, setProfile] = useState<AgentProfile>({ name: "Nova" });
+  const [isMacOS, setIsMacOS] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -87,27 +95,130 @@ export function Layout({ currentPage, onNavigate, children, gatewayRunning, inte
     };
   }, []);
 
+  useEffect(() => {
+    try {
+      setIsMacOS(platform() === "macos");
+    } catch {
+      setIsMacOS(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("nova.sidebarCollapsed");
+      if (saved === "1") {
+        setSidebarCollapsed(true);
+      }
+    } catch {
+      // ignore storage failures
+    }
+  }, []);
+
+  function toggleSidebarCollapsed() {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem("nova.sidebarCollapsed", next ? "1" : "0");
+      } catch {
+        // ignore storage failures
+      }
+      return next;
+    });
+  }
+
+  async function windowAction(action: "close" | "minimize" | "expand") {
+    try {
+      const win = getCurrentWindow();
+      if (action === "close") {
+        await win.close();
+      } else if (action === "minimize") {
+        await win.minimize();
+      } else {
+        await win.toggleMaximize();
+      }
+    } catch (err) {
+      console.error("[Nova] Window action failed:", err);
+    }
+  }
+
   return (
     <div className="h-screen w-screen flex bg-[var(--bg-app)] text-[var(--text-primary)] font-sans overflow-hidden">
       {/* Sidebar - Transparent blend */}
       <div
         data-tauri-drag-region
         onMouseDown={startDrag}
-        className="w-[240px] flex flex-col flex-shrink-0 bg-transparent pt-8 pb-4 pl-4 pr-2"
+        className={clsx(
+          "flex flex-col flex-shrink-0 bg-transparent pb-4 pt-2 transition-[width,padding] duration-200",
+          sidebarCollapsed ? "w-[74px] pl-1.5 pr-1" : "w-[240px] pl-3 pr-2"
+        )}
       >
-        {/* Profile / Brand */}
-        <div className="px-2 mb-6 flex items-center gap-3">
-          <img src={novaLogo} alt="Nova" className="w-8 h-8 rounded-lg shadow-md" />
-          <div className="font-semibold text-lg tracking-tight text-[var(--text-primary)]">
-            Nova
+        <div className={clsx("h-8 mb-3 flex items-center gap-2", sidebarCollapsed ? "justify-between px-0.5" : "px-1")}>
+          {isMacOS && (
+            <div className="flex items-center gap-2">
+              <button
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={() => windowAction("close")}
+                className="group w-3 h-3 rounded-full bg-[#ff5f57] border border-black/10 hover:brightness-95 transition"
+                title="Close"
+                aria-label="Close window"
+              >
+                <X className="w-2 h-2 mx-auto text-black/60 opacity-0 group-hover:opacity-100 transition-opacity" />
+              </button>
+              <button
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={() => windowAction("minimize")}
+                className="group w-3 h-3 rounded-full bg-[#ffbd2e] border border-black/10 hover:brightness-95 transition"
+                title="Minimize"
+                aria-label="Minimize window"
+              >
+                <Minus className="w-2 h-2 mx-auto text-black/60 opacity-0 group-hover:opacity-100 transition-opacity" />
+              </button>
+              <button
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={() => windowAction("expand")}
+                className="group w-3 h-3 rounded-full bg-[#28c840] border border-black/10 hover:brightness-95 transition"
+                title="Expand"
+                aria-label="Expand window"
+              >
+                <Square className="w-2 h-2 mx-auto text-black/60 opacity-0 group-hover:opacity-100 transition-opacity" />
+              </button>
+            </div>
+          )}
+
+          <div
+            data-tauri-drag-region
+            onMouseDown={startDrag}
+            className={clsx(
+              "h-full flex items-center",
+              sidebarCollapsed ? "justify-center flex-1" : "gap-3 flex-1 min-w-0"
+            )}
+          >
+            <img src={novaLogo} alt="Nova" className="w-8 h-8 rounded-lg shadow-md" />
+            {!sidebarCollapsed && (
+              <div className="font-semibold text-lg tracking-tight text-[var(--text-primary)]">
+                Nova
+              </div>
+            )}
           </div>
+
+          <button
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={toggleSidebarCollapsed}
+            className="w-7 h-7 rounded-md bg-black/5 hover:bg-black/10 text-[var(--text-secondary)] hover:text-[var(--text-primary)] flex items-center justify-center transition-colors"
+            title={sidebarCollapsed ? "Expand navigation" : "Collapse navigation"}
+            aria-label={sidebarCollapsed ? "Expand navigation" : "Collapse navigation"}
+          >
+            {sidebarCollapsed ? <PanelLeftOpen className="w-4 h-4" /> : <PanelLeftClose className="w-4 h-4" />}
+          </button>
         </div>
 
         {/* Navigation */}
-        <nav className="flex-1 space-y-0.5 overflow-y-auto pr-2 custom-scrollbar">
-          <div className="text-[11px] font-semibold text-[var(--text-tertiary)] uppercase tracking-wider px-3 mb-2 mt-2">
-            Menu
-          </div>
+        <nav className={clsx("flex-1 space-y-0.5 overflow-y-auto custom-scrollbar", sidebarCollapsed ? "pr-1" : "pr-2")}>
+          {!sidebarCollapsed && (
+            <div className="text-[11px] font-semibold text-[var(--text-tertiary)] uppercase tracking-wider px-3 mb-2 mt-0">
+              Menu
+            </div>
+          )}
           
           {navItems.map((item) => {
             const Icon = item.icon;
@@ -119,7 +230,8 @@ export function Layout({ currentPage, onNavigate, children, gatewayRunning, inte
                 <button
                   onClick={() => isChat ? onNewChat?.() : onNavigate(item.id)}
                     className={clsx(
-                      "w-full flex items-center gap-3 px-3 py-2 rounded-md text-[13px] font-medium transition-all duration-200",
+                      "w-full flex items-center rounded-md text-[13px] font-medium transition-all duration-200",
+                      sidebarCollapsed ? "justify-center px-1.5 py-2" : "gap-3 px-3 py-2",
                       isActive
                       ? "bg-[rgba(0,0,0,0.06)] text-black shadow-sm"
                       : "text-black/70 hover:bg-[rgba(0,0,0,0.03)] hover:text-black"
@@ -135,11 +247,11 @@ export function Layout({ currentPage, onNavigate, children, gatewayRunning, inte
                       className={clsx("w-5 h-5", isActive ? "text-[var(--purple-accent)]" : "text-[var(--text-tertiary)]")}
                     />
                   </div>
-                  {item.label}
+                  {!sidebarCollapsed && item.label}
                 </button>
 
                 {/* Chat History sub-items */}
-                {isChat && chatSessions && chatSessions.length > 0 && (
+                {!sidebarCollapsed && isChat && chatSessions && chatSessions.length > 0 && (
                   <div className="mt-1 ml-2 pl-2 border-l border-[var(--border-subtle)] space-y-0.5">
                     {chatSessions.slice(0, 5).map((session) => (
                       <button
@@ -163,10 +275,13 @@ export function Layout({ currentPage, onNavigate, children, gatewayRunning, inte
         </nav>
 
         {/* User / Gateway Status Footer */}
-        <div className="mt-auto px-2 pt-4">
+        <div className={clsx("mt-auto pt-4", sidebarCollapsed ? "px-1" : "px-2")}>
           <button
              onClick={() => onNavigate("settings")}
-             className="w-full flex items-center gap-3 p-2 rounded-lg hover:bg-[rgba(0,0,0,0.04)] transition-colors text-left group"
+             className={clsx(
+               "w-full flex items-center p-2 rounded-lg hover:bg-[rgba(0,0,0,0.04)] transition-colors text-left group",
+               sidebarCollapsed ? "justify-center" : "gap-3"
+             )}
           >
             <div className="w-8 h-8 rounded-full bg-gray-200 overflow-hidden flex-shrink-0 border border-black/5">
               {profile.avatarDataUrl ? (
@@ -177,27 +292,28 @@ export function Layout({ currentPage, onNavigate, children, gatewayRunning, inte
                 </div>
               )}
             </div>
-            <div className="flex-1 min-w-0">
-              <div className="text-[13px] font-medium text-[var(--text-primary)] truncate group-hover:text-black">
-                {profile.name}
+            {!sidebarCollapsed && (
+              <div className="flex-1 min-w-0">
+                <div className="text-[13px] font-medium text-[var(--text-primary)] truncate group-hover:text-black">
+                  {profile.name}
+                </div>
+                <div className="flex items-center gap-1.5 mt-0.5">
+                  <div className={clsx("w-1.5 h-1.5 rounded-full", gatewayRunning ? "bg-green-500" : "bg-gray-300")} />
+                  <span className="text-[11px] text-[var(--text-tertiary)]">
+                    {gatewayRunning ? "Online" : "Offline"}
+                  </span>
+                </div>
               </div>
-              <div className="flex items-center gap-1.5 mt-0.5">
-                <div className={clsx("w-1.5 h-1.5 rounded-full", gatewayRunning ? "bg-green-500" : "bg-gray-300")} />
-                <span className="text-[11px] text-[var(--text-tertiary)]">
-                  {gatewayRunning ? "Online" : "Offline"}
-                </span>
-              </div>
-            </div>
-            <Settings className="w-4 h-4 text-[var(--text-tertiary)] opacity-0 group-hover:opacity-100 transition-opacity" />
+            )}
+            {!sidebarCollapsed && (
+              <Settings className="w-4 h-4 text-[var(--text-tertiary)] opacity-0 group-hover:opacity-100 transition-opacity" />
+            )}
           </button>
         </div>
       </div>
 
       {/* Main Content Area - The "Content Card" */}
-      <div className="flex-1 h-screen p-4 pl-0 overflow-hidden flex flex-col">
-        {/* Window Drag Region */}
-        <div data-tauri-drag-region onMouseDown={startDrag} className="h-6 flex-shrink-0" />
-        
+      <div className="flex-1 h-screen p-2 pl-0 overflow-hidden flex flex-col">
         {/* The Card */}
         <main className="flex-1 bg-white rounded-2xl shadow-sm border border-[var(--border-subtle)] overflow-hidden flex flex-col relative ml-2">
           <div className="absolute inset-0 overflow-y-auto scroll-smooth">

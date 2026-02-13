@@ -181,6 +181,21 @@ function AppContent() {
 }
 
 function App() {
+  useEffect(() => {
+    try {
+      const os = platform();
+      const isMac = os === "macos";
+      document.documentElement.classList.toggle("platform-macos", isMac);
+      document.body.classList.toggle("platform-macos", isMac);
+    } catch {
+      // ignore platform detection failures
+    }
+    return () => {
+      document.documentElement.classList.remove("platform-macos");
+      document.body.classList.remove("platform-macos");
+    };
+  }, []);
+
   return (
     <AuthProvider>
       <AppContent />
