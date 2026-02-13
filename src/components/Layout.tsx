@@ -17,6 +17,10 @@ import {
   Minus,
   Square,
   X,
+  MoreHorizontal,
+  Pencil,
+  Pin,
+  Trash2,
 } from "lucide-react";
 import novaLogo from "../assets/nova-logo.png";
 import type { ChatSession } from "../pages/Chat";
@@ -44,6 +48,12 @@ type Props = {
   currentChatSession?: string | null;
   onSelectChatSession?: (key: string) => void;
   onNewChat?: () => void;
+  onChatSessionAction?: (
+    action:
+      | { type: "delete"; key: string }
+      | { type: "pin"; key: string; pinned: boolean }
+      | { type: "rename"; key: string; label: string },
+  ) => void;
 };
 
 const navItems: { id: Page; label: string; icon: typeof MessageSquare }[] = [
@@ -72,11 +82,23 @@ function sessionTitle(s: ChatSession): string {
   return s.label || s.displayName || s.derivedTitle || `Chat ${s.key.slice(0, 8)}`;
 }
 
-export function Layout({ currentPage, onNavigate, children, gatewayRunning, integrationsSyncing, chatSessions, currentChatSession, onSelectChatSession, onNewChat }: Props) {
+export function Layout({
+  currentPage,
+  onNavigate,
+  children,
+  gatewayRunning,
+  integrationsSyncing,
+  chatSessions,
+  currentChatSession,
+  onSelectChatSession,
+  onNewChat,
+  onChatSessionAction,
+}: Props) {
   const [profile, setProfile] = useState<AgentProfile>({ name: "Nova" });
   const [isMacOS, setIsMacOS] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [showAllChatSessions, setShowAllChatSessions] = useState(false);
+  const [openSessionMenuKey, setOpenSessionMenuKey] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -94,6 +116,19 @@ export function Layout({ currentPage, onNavigate, children, gatewayRunning, inte
       cancelled = true;
       window.removeEventListener("nova-profile-updated", handler);
     };
+  }, []);
+
+  useEffect(() => {
+    const onPointerDown = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target) return;
+      if (target.closest("[data-chat-session-menu]") || target.closest("[data-chat-session-trigger]")) {
+        return;
+      }
+      setOpenSessionMenuKey(null);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => window.removeEventListener("pointerdown", onPointerDown);
   }, []);
 
   useEffect(() => {
@@ -127,10 +162,18 @@ export function Layout({ currentPage, onNavigate, children, gatewayRunning, inte
     });
   }
 
+  const sortedChatSessions = [...(chatSessions || [])].sort((a, b) => {
+    const aPinned = a.pinned ? 1 : 0;
+    const bPinned = b.pinned ? 1 : 0;
+    if (aPinned !== bPinned) return bPinned - aPinned;
+    const aUpdated = typeof a.updatedAt === "number" ? a.updatedAt : 0;
+    const bUpdated = typeof b.updatedAt === "number" ? b.updatedAt : 0;
+    return bUpdated - aUpdated;
+  });
   const visibleChatSessions = showAllChatSessions
-    ? (chatSessions || [])
-    : (chatSessions || []).slice(0, 5);
-  const hasMoreChatSessions = (chatSessions?.length || 0) > 5;
+    ? sortedChatSessions
+    : sortedChatSessions.slice(0, 5);
+  const hasMoreChatSessions = sortedChatSessions.length > 5;
 
   async function windowAction(action: "close" | "minimize" | "expand") {
     try {
@@ -260,25 +303,96 @@ export function Layout({ currentPage, onNavigate, children, gatewayRunning, inte
                 {!sidebarCollapsed && isChat && chatSessions && chatSessions.length > 0 && (
                   <div className="mt-1 ml-2 pl-2 border-l border-[var(--border-subtle)] space-y-0.5">
                     {visibleChatSessions.map((session) => (
-                      <button
-                        key={session.key}
-                        onClick={() => onSelectChatSession?.(session.key)}
-                        className={clsx(
-                          "w-full flex items-center gap-2 px-3 py-1 rounded-md text-[12px] transition-colors text-left",
-                          currentChatSession === session.key
-                            ? "bg-[rgba(147,51,234,0.08)] text-[var(--purple-accent)] font-medium"
-                            : "text-[var(--text-secondary)] hover:bg-[rgba(0,0,0,0.03)]"
+                      <div key={session.key} className="relative flex items-center gap-1">
+                        <button
+                          onClick={() => {
+                            setOpenSessionMenuKey(null);
+                            onSelectChatSession?.(session.key);
+                          }}
+                          className={clsx(
+                            "flex-1 flex items-center gap-2 px-3 py-1 rounded-md text-[12px] transition-colors text-left min-w-0",
+                            currentChatSession === session.key
+                              ? "bg-[rgba(147,51,234,0.08)] text-[var(--purple-accent)] font-medium"
+                              : "text-[var(--text-secondary)] hover:bg-[rgba(0,0,0,0.03)]"
+                          )}
+                        >
+                          {session.pinned ? <Pin className="w-3 h-3 text-[var(--text-tertiary)]" /> : null}
+                          <span className="truncate flex-1">{sessionTitle(session)}</span>
+                        </button>
+                        <button
+                          data-chat-session-trigger
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setOpenSessionMenuKey((prev) => (prev === session.key ? null : session.key));
+                          }}
+                          className="p-1 rounded-md text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[rgba(0,0,0,0.05)] transition-colors"
+                          title="Chat options"
+                          aria-label="Chat options"
+                        >
+                          <MoreHorizontal className="w-3.5 h-3.5" />
+                        </button>
+                        {openSessionMenuKey === session.key && (
+                          <div
+                            data-chat-session-menu
+                            className="absolute right-0 top-7 z-30 w-40 rounded-lg border border-[var(--border-subtle)] bg-white shadow-lg p-1"
+                          >
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const nextLabel = window.prompt("Rename chat", sessionTitle(session));
+                                if (nextLabel !== null && nextLabel.trim()) {
+                                  onChatSessionAction?.({
+                                    type: "rename",
+                                    key: session.key,
+                                    label: nextLabel.trim(),
+                                  });
+                                }
+                                setOpenSessionMenuKey(null);
+                              }}
+                              className="w-full flex items-center gap-2 rounded-md px-2 py-1.5 text-[12px] text-left text-[var(--text-primary)] hover:bg-[var(--bg-secondary)]"
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                              Rename
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onChatSessionAction?.({
+                                  type: "pin",
+                                  key: session.key,
+                                  pinned: !session.pinned,
+                                });
+                                setOpenSessionMenuKey(null);
+                              }}
+                              className="w-full flex items-center gap-2 rounded-md px-2 py-1.5 text-[12px] text-left text-[var(--text-primary)] hover:bg-[var(--bg-secondary)]"
+                            >
+                              <Pin className="w-3.5 h-3.5" />
+                              {session.pinned ? "Unpin" : "Pin"}
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const confirmed = window.confirm("Delete this chat?");
+                                if (confirmed) {
+                                  onChatSessionAction?.({ type: "delete", key: session.key });
+                                }
+                                setOpenSessionMenuKey(null);
+                              }}
+                              className="w-full flex items-center gap-2 rounded-md px-2 py-1.5 text-[12px] text-left text-red-600 hover:bg-red-50"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                              Delete
+                            </button>
+                          </div>
                         )}
-                      >
-                        <span className="truncate flex-1">{sessionTitle(session)}</span>
-                      </button>
+                      </div>
                     ))}
                     {hasMoreChatSessions && (
                       <button
                         onClick={() => setShowAllChatSessions((prev) => !prev)}
                         className="w-full px-3 py-1 text-left rounded-md text-[11px] font-medium text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[rgba(0,0,0,0.03)] transition-colors"
                       >
-                        {showAllChatSessions ? "Show less" : `Show ${chatSessions.length - 5} more`}
+                        {showAllChatSessions ? "Show less" : `Show ${sortedChatSessions.length - 5} more`}
                       </button>
                     )}
                   </div>

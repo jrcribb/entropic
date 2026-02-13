@@ -3,8 +3,7 @@ import { Send, Sparkles, X, Loader2, ExternalLink, Paperclip, MessageSquare, Cal
 import { open } from "@tauri-apps/plugin-shell";
 import { invoke } from "@tauri-apps/api/core";
 import clsx from "clsx";
-import { GatewayClient, createGatewayClient, type ChatEvent, type GatewayMessage } from "../lib/gateway";
-import { resolveGatewayAuth } from "../lib/gateway-auth";
+import { GatewayClient, createGatewayClient, type ChatEvent, type AgentEvent, type GatewayMessage } from "../lib/gateway";
 import { loadOnboardingData, type OnboardingData } from "../lib/profile";
 import { SuggestionChip, type SuggestionAction } from "../components/SuggestionChip";
 import { ChannelSetupModal } from "../components/ChannelSetupModal";
@@ -22,8 +21,24 @@ type Message = {
   kind?: "toolResult";
   toolName?: string;
   sentAt?: number | null;
+  assistantPayload?: {
+    events: CalendarEvent[];
+    errors: ToolError[];
+    hadToolPayload: boolean;
+  };
 };
-export type ChatSession = { key: string; label?: string; displayName?: string; derivedTitle?: string; updatedAt?: number | null };
+export type ChatSession = {
+  key: string;
+  label?: string;
+  displayName?: string;
+  derivedTitle?: string;
+  updatedAt?: number | null;
+  pinned?: boolean;
+};
+export type ChatSessionActionRequest =
+  | { id: string; type: "delete"; key: string }
+  | { id: string; type: "pin"; key: string; pinned: boolean }
+  | { id: string; type: "rename"; key: string; label: string };
 type Provider = { id: string; name: string; icon: string; placeholder: string; keyUrl: string };
 type PendingAttachment = { id: string; fileName: string; tempPath: string; savedPath?: string };
 type AuthState = { active_provider: string | null; providers: Array<{ id: string; has_key: boolean }> };
@@ -41,6 +56,50 @@ type PersistedChatData = {
   drafts: Record<string, string>; // sessionKey -> unsent draft
   currentSession: string | null;
 };
+
+function normalizeSessionsList(list: ChatSession[]): ChatSession[] {
+  const byKey = new Map<string, ChatSession>();
+  for (const raw of list) {
+    const key = typeof raw?.key === "string" ? raw.key.trim() : "";
+    if (!key) continue;
+    const prev = byKey.get(key);
+    if (!prev) {
+      byKey.set(key, { ...raw, key });
+      continue;
+    }
+    byKey.set(key, {
+      ...prev,
+      ...raw,
+      key,
+      pinned: (raw as ChatSession & { pinned?: boolean }).pinned ?? (prev as ChatSession & { pinned?: boolean }).pinned,
+    });
+  }
+  return [...byKey.values()].sort((a, b) => {
+    const aPinned = (a as ChatSession & { pinned?: boolean }).pinned ? 1 : 0;
+    const bPinned = (b as ChatSession & { pinned?: boolean }).pinned ? 1 : 0;
+    if (aPinned !== bPinned) return bPinned - aPinned;
+    const aUpdated = typeof a.updatedAt === "number" ? a.updatedAt : 0;
+    const bUpdated = typeof b.updatedAt === "number" ? b.updatedAt : 0;
+    return bUpdated - aUpdated;
+  });
+}
+
+function overlaySessionMetadata(next: ChatSession[], metadataSources: ChatSession[]): ChatSession[] {
+  const metaByKey = new Map<string, ChatSession>();
+  for (const item of metadataSources) {
+    if (!item?.key) continue;
+    metaByKey.set(item.key, item);
+  }
+  const merged = next.map((session) => {
+    const meta = metaByKey.get(session.key) as (ChatSession & { pinned?: boolean }) | undefined;
+    const current = session as ChatSession & { pinned?: boolean };
+    return {
+      ...session,
+      pinned: current.pinned ?? meta?.pinned,
+    };
+  });
+  return normalizeSessionsList(merged);
+}
 
 let _chatStore: TauriStore | null = null;
 async function getChatStore(): Promise<TauriStore> {
@@ -153,6 +212,49 @@ function extractJsonBlocks(text: string): Array<{ jsonText: string; start: numbe
   return blocks.sort((a, b) => a.start - b.start);
 }
 
+function isToolTransportPayload(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj);
+
+  const hasWebFetchShape =
+    ("url" in obj || "finalUrl" in obj) &&
+    "status" in obj &&
+    ("contentType" in obj || "extractMode" in obj || "extractor" in obj);
+  const hasWebSearchShape =
+    "query" in obj &&
+    "provider" in obj &&
+    ("content" in obj || "citations" in obj || "model" in obj);
+  const hasToolErrorShape = "error" in obj && ("message" in obj || "docs" in obj) && keys.length <= 8;
+  const wrappedExternalInText =
+    typeof obj.text === "string" &&
+    (obj.text.includes("SECURITY NOTICE:") || obj.text.includes("<<<EXTERNAL_UNTRUSTED_CONTENT>>>"));
+  const wrappedExternalInContent =
+    typeof obj.content === "string" &&
+    (obj.content.includes("SECURITY NOTICE:") || obj.content.includes("<<<EXTERNAL_UNTRUSTED_CONTENT>>>"));
+
+  return (
+    hasWebFetchShape ||
+    hasWebSearchShape ||
+    hasToolErrorShape ||
+    wrappedExternalInText ||
+    wrappedExternalInContent
+  );
+}
+
+function stripExternalUntrustedSections(raw: string): string {
+  if (!raw) return "";
+  let text = raw;
+  text = text.replace(
+    /SECURITY NOTICE:[\s\S]*?<<<EXTERNAL_UNTRUSTED_CONTENT>>>[\s\S]*?<<<END_EXTERNAL_UNTRUSTED_CONTENT>>>/gi,
+    ""
+  );
+  text = text.replace(/<<<EXTERNAL_UNTRUSTED_CONTENT>>>[\s\S]*?<<<END_EXTERNAL_UNTRUSTED_CONTENT>>>/gi, "");
+  return text.trim();
+}
+
 function parseToolPayloads(raw: string): {
   cleanText: string;
   events: CalendarEvent[];
@@ -163,6 +265,9 @@ function parseToolPayloads(raw: string): {
     const direct = JSON.parse(raw);
     if (typeof direct === "string") {
       return parseToolPayloads(direct);
+    }
+    if (isToolTransportPayload(direct)) {
+      return { cleanText: "", events: [], errors: [], hadToolPayload: true };
     }
     if (direct && typeof direct === "object") {
       const events = Array.isArray((direct as any).events) ? (direct as any).events as CalendarEvent[] : [];
@@ -189,6 +294,10 @@ function parseToolPayloads(raw: string): {
   for (const block of blocks) {
     try {
       const parsed = JSON.parse(block.jsonText);
+      if (isToolTransportPayload(parsed)) {
+        removalRanges.push({ start: block.start, end: block.end });
+        continue;
+      }
       if (parsed && typeof parsed === "object") {
         if (Array.isArray((parsed as any).events)) {
           events.push(...(parsed as any).events);
@@ -333,6 +442,16 @@ function stripInlineClawdbotMetadata(raw: string): string {
 function sanitizeAssistantDisplayContent(raw: string): string {
   if (!raw) return "";
   let text = stripConversationMetadata(raw);
+  text = stripExternalUntrustedSections(text);
+
+  try {
+    const direct = JSON.parse(text);
+    if (isToolTransportPayload(direct)) {
+      return "";
+    }
+  } catch {
+    // ignore non-JSON
+  }
 
   // Hide OpenClaw internal skill manifest metadata payloads (machine format).
   text = text.replace(
@@ -346,6 +465,32 @@ function sanitizeAssistantDisplayContent(raw: string): string {
   text = stripInlineClawdbotMetadata(text);
 
   return text.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function buildAssistantPayload(raw: string) {
+  const cleaned = sanitizeAssistantDisplayContent(raw);
+  const parsed = parseToolPayloads(cleaned);
+  return {
+    content: parsed.cleanText,
+    assistantPayload: {
+      events: parsed.events,
+      errors: parsed.errors,
+      hadToolPayload: parsed.hadToolPayload,
+    },
+  };
+}
+
+function normalizeCachedMessage(message: Message): Message {
+  if (message.role !== "assistant") return message;
+  const prepared = buildAssistantPayload(message.content || "");
+  if (!prepared.content && prepared.assistantPayload.events.length === 0 && prepared.assistantPayload.errors.length === 0) {
+    return { ...message, content: "", assistantPayload: prepared.assistantPayload };
+  }
+  return {
+    ...message,
+    content: prepared.content,
+    assistantPayload: prepared.assistantPayload,
+  };
 }
 
 function parseUtcBracketTimestamp(raw: string): { text: string; sentAt: number | null } {
@@ -469,20 +614,31 @@ function normalizeGatewayMessage(message: GatewayMessage, id: string): Message |
   if (roleRaw === "assistant") {
     if (!hasText && !hasNonText) return null;
     if (!hasText) return null;
-    const cleanText = sanitizeAssistantDisplayContent(text);
-    if (!cleanText) return null;
-    return { id, role: "assistant", content: cleanText, sentAt: messageTimestamp };
-  }
-  if (roleRaw === "toolresult" || roleRaw === "tool_result" || roleRaw === "tool") {
-    if (!hasText) return null;
-    const cleanText = sanitizeAssistantDisplayContent(text);
-    if (!cleanText) return null;
+    const prepared = buildAssistantPayload(text);
+    if (!prepared.content && prepared.assistantPayload.events.length === 0 && prepared.assistantPayload.errors.length === 0) {
+      return null;
+    }
     return {
       id,
       role: "assistant",
-      content: cleanText,
+      content: prepared.content,
+      assistantPayload: prepared.assistantPayload,
+      sentAt: messageTimestamp,
+    };
+  }
+  if (roleRaw === "toolresult" || roleRaw === "tool_result" || roleRaw === "tool") {
+    if (!hasText) return null;
+    const prepared = buildAssistantPayload(text);
+    if (!prepared.content && prepared.assistantPayload.events.length === 0 && prepared.assistantPayload.errors.length === 0) {
+      return null;
+    }
+    return {
+      id,
+      role: "assistant",
+      content: prepared.content,
       kind: "toolResult",
       toolName: typeof message.toolName === "string" ? message.toolName : undefined,
+      assistantPayload: prepared.assistantPayload,
       sentAt: messageTimestamp,
     };
   }
@@ -496,6 +652,7 @@ const PROVIDERS: Provider[] = [
 ];
 
 const DEFAULT_GATEWAY_URL = "ws://127.0.0.1:19789";
+const GATEWAY_TOKEN = "nova-local-gateway";
 const HISTORY_LIMIT = 500;
 
 function buildSuggestions(userName: string, hasName: boolean) {
@@ -556,6 +713,7 @@ export function Chat({
   gatewayStarting,
   gatewayRetryIn,
   onStartGateway,
+  onRecoverProxyAuth,
   useLocalKeys,
   selectedModel,
   imageModel: _imageModel,
@@ -564,11 +722,13 @@ export function Chat({
   onNavigate,
   onSessionsChange,
   requestedSession,
+  requestedSessionAction,
 }: {
   gatewayRunning: boolean;
   gatewayStarting: boolean;
   gatewayRetryIn: number | null;
   onStartGateway?: () => void;
+  onRecoverProxyAuth?: () => Promise<boolean> | boolean;
   useLocalKeys: boolean;
   selectedModel: string;
   imageModel: string;
@@ -577,12 +737,14 @@ export function Chat({
   onNavigate?: (page: Page) => void;
   onSessionsChange?: (sessions: ChatSession[], currentKey: string | null) => void;
   requestedSession?: string | null;
+  requestedSessionAction?: ChatSessionActionRequest | null;
 }) {
   const { isAuthenticated, isAuthConfigured } = useAuth();
   const proxyEnabled = isAuthConfigured && isAuthenticated && !useLocalKeys;
   const [messages, setMessages] = useState<Message[]>([]);
   const [draftsBySession, setDraftsBySession] = useState<Record<string, string>>({});
   const [isLoading, setIsLoading] = useState(false);
+  const [thinkingStatus, setThinkingStatus] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -625,18 +787,79 @@ export function Chat({
   const currentSessionRef = useRef<string | null>(null);
   const draftsRef = useRef<Record<string, string>>({});
   const handledRequestedSessionRef = useRef<string | null>(null);
+  const handledRequestedActionRef = useRef<string | null>(null);
   const handlersRef = useRef<{
     connected?: () => void;
     disconnected?: () => void;
     chat?: (event: ChatEvent) => void;
+    agent?: (event: AgentEvent) => void;
     error?: (error: string) => void;
   }>({});
   const lastEventByRunIdRef = useRef<Record<string, number>>({});
   const lastIntegrationsSyncRef = useRef<number>(0);
+  const proxyAuthRecoveryInFlightRef = useRef(false);
+  const lastProxyAuthRecoveryAtRef = useRef(0);
   // Local persistence: cache messages per session key
   const sessionMessagesRef = useRef<Record<string, Message[]>>({});
   const persistTimerRef = useRef<number | null>(null);
   const restoredFromCacheRef = useRef(false);
+  const lastChatEventRef = useRef<ChatEvent | null>(null);
+  const showDiagnosticsRef = useRef(false);
+  const activeRunIdRef = useRef<string | null>(null);
+  const activeRunSessionRef = useRef<string | null>(null);
+  const activeRunTimeoutRef = useRef<number | null>(null);
+
+  function isProxyAuthFailure(message?: string | null): boolean {
+    if (!message) return false;
+    const text = message.toLowerCase();
+    if (text.includes("invalid gateway token")) return true;
+    if (text.includes("gateway token validation failed")) return true;
+    if (text.includes("ai provider error: 401")) return true;
+    const has401 = text.includes("401") || text.includes("unauthorized");
+    const looksProxy = text.includes("chat/completions") || text.includes("ai provider");
+    return has401 && looksProxy;
+  }
+
+  function triggerProxyAuthRecovery(source: string) {
+    if (!proxyEnabled || !onRecoverProxyAuth) return;
+    const now = Date.now();
+    const recoveryCooldownMs = 30_000;
+    const inCooldown = now - lastProxyAuthRecoveryAtRef.current < recoveryCooldownMs;
+    if (proxyAuthRecoveryInFlightRef.current || inCooldown) {
+      addDiag(`proxy auth recovery skipped (${source}; already in progress or cooldown)`);
+      return;
+    }
+
+    proxyAuthRecoveryInFlightRef.current = true;
+    lastProxyAuthRecoveryAtRef.current = now;
+    setError("Proxy session expired. Reconnecting securely...");
+    addDiag(`proxy auth failure detected from ${source}; refreshing gateway token`);
+
+    Promise.resolve(onRecoverProxyAuth())
+      .then((ok) => {
+        if (ok) {
+          setError("Proxy session refreshed. Please resend your last message.");
+          addDiag("proxy auth recovery succeeded");
+        } else {
+          setError("Failed to refresh proxy session. Retry from Settings > Gateway.");
+          addDiag("proxy auth recovery failed");
+        }
+      })
+      .catch((err) => {
+        setError("Failed to refresh proxy session. Retry from Settings > Gateway.");
+        addDiag(`proxy auth recovery error: ${String(err)}`);
+      })
+      .finally(() => {
+        proxyAuthRecoveryInFlightRef.current = false;
+      });
+  }
+
+  useEffect(() => {
+    showDiagnosticsRef.current = showDiagnostics;
+    if (showDiagnostics && lastChatEventRef.current) {
+      setLastChatEvent(lastChatEventRef.current);
+    }
+  }, [showDiagnostics]);
 
   useEffect(() => {
     invoke<{
@@ -659,13 +882,16 @@ export function Chat({
     loadPersistedChatData().then((cached) => {
       if (!cached) return;
       if (cached.sessions.length > 0) {
-        setSessions(cached.sessions);
+        setSessions(normalizeSessionsList(cached.sessions));
         sessionMessagesRef.current = cached.messages || {};
+        for (const [sessionKey, msgs] of Object.entries(sessionMessagesRef.current)) {
+          sessionMessagesRef.current[sessionKey] = msgs.map(normalizeCachedMessage);
+        }
         setDraftsBySession(cached.drafts || {});
         const restoreKey = cached.currentSession || cached.sessions[0].key;
         currentSessionRef.current = restoreKey;
         setCurrentSession(restoreKey);
-        const restoredMsgs = cached.messages[restoreKey] || [];
+        const restoredMsgs = (cached.messages[restoreKey] || []).map(normalizeCachedMessage);
         setMessages(restoredMsgs);
         if (restoredMsgs.length > 0) setShowWelcome(false);
       }
@@ -712,6 +938,7 @@ export function Chat({
   useEffect(() => {
     return () => {
       if (persistTimerRef.current) window.clearTimeout(persistTimerRef.current);
+      clearActiveRunTracking();
       const sessionsSnap = sessionsRef.current;
       const currentSnap = currentSessionRef.current;
       const messagesSnap = { ...sessionMessagesRef.current };
@@ -735,6 +962,28 @@ export function Chat({
     });
   }
 
+  function clearActiveRunTracking() {
+    activeRunIdRef.current = null;
+    activeRunSessionRef.current = null;
+    if (activeRunTimeoutRef.current) {
+      window.clearTimeout(activeRunTimeoutRef.current);
+      activeRunTimeoutRef.current = null;
+    }
+  }
+
+  function scheduleActiveRunTimeout(runId: string, sessionKey: string) {
+    clearActiveRunTracking();
+    activeRunIdRef.current = runId;
+    activeRunSessionRef.current = sessionKey;
+    activeRunTimeoutRef.current = window.setTimeout(() => {
+      if (activeRunIdRef.current !== runId) return;
+      setIsLoading(false);
+      setError("Response timed out. Please retry.");
+      addDiag(`run timeout after 45s runId=${runId}`);
+      clearActiveRunTracking();
+    }, 45_000);
+  }
+
   // Emit session list to parent (for sidebar rendering)
   useEffect(() => {
     onSessionsChange?.(sessions, currentSession);
@@ -756,7 +1005,17 @@ export function Chat({
   }, [requestedSession, currentSession]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (!requestedSessionAction) {
+      handledRequestedActionRef.current = null;
+      return;
+    }
+    if (handledRequestedActionRef.current === requestedSessionAction.id) return;
+    handledRequestedActionRef.current = requestedSessionAction.id;
+    void applySessionAction(requestedSessionAction);
+  }, [requestedSessionAction]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: isLoading ? "auto" : "smooth" });
   }, [messages, isLoading]);
 
   useEffect(() => {
@@ -774,11 +1033,7 @@ export function Chat({
       setProviderStatus(state.providers);
       setConnectedProvider(state.active_provider || state.providers.find(p => p.has_key)?.id || null);
     }).catch(console.error);
-    resolveGatewayAuth()
-      .then(({ wsUrl }) => {
-        if (wsUrl) setGatewayUrl(wsUrl);
-      })
-      .catch(console.error);
+    invoke<string>("get_gateway_ws_url").then(url => url && setGatewayUrl(url)).catch(console.error);
   }, []);
 
   // If authenticated via proxy, treat as connected even without local API keys
@@ -831,11 +1086,8 @@ export function Chat({
     setIsConnecting(true);
     setError(null);
     try {
-      const { wsUrl, token } = await resolveGatewayAuth();
-      const nextUrl = wsUrl || gatewayUrl || DEFAULT_GATEWAY_URL;
-      setGatewayUrl(nextUrl);
-      addDiag(`connect -> ${nextUrl}`);
-      const client = createGatewayClient(nextUrl, token);
+      addDiag(`connect -> ${gatewayUrl}`);
+      const client = createGatewayClient(gatewayUrl, GATEWAY_TOKEN);
       clientRef.current = client;
       detachGatewayListeners(client);
       const onConnected = () => {
@@ -863,23 +1115,36 @@ export function Chat({
       };
       const onDisconnected = () => {
         setConnected(false);
+        if (activeRunIdRef.current) {
+          setIsLoading(false);
+          setError("Connection lost while waiting for response. Please retry.");
+          addDiag(`active run interrupted by disconnect runId=${activeRunIdRef.current}`);
+          clearActiveRunTracking();
+        }
         addDiag("gateway disconnected");
       };
       const onChat = (event: ChatEvent) => handleChatEvent(event);
+      const onAgent = (event: AgentEvent) => handleAgentEvent(event);
       const onError = (err: string) => {
         const suppressError = gatewayStarting || isConnecting || !gatewayRunning;
         if (!suppressError) {
           setError(err);
         }
         setIsConnecting(false);
+        if (activeRunIdRef.current) {
+          setIsLoading(false);
+          addDiag(`active run interrupted by gateway error runId=${activeRunIdRef.current}`);
+          clearActiveRunTracking();
+        }
         setLastGatewayError(err);
         addDiag(`gateway error: ${err}`);
       };
       client.on("connected", onConnected);
       client.on("disconnected", onDisconnected);
       client.on("chat", onChat);
+      client.on("agent", onAgent);
       client.on("error", onError);
-      handlersRef.current = { connected: onConnected, disconnected: onDisconnected, chat: onChat, error: onError };
+      handlersRef.current = { connected: onConnected, disconnected: onDisconnected, chat: onChat, agent: onAgent, error: onError };
       if (client.isConnected()) {
         onConnected();
       } else {
@@ -899,8 +1164,54 @@ export function Chat({
     if (handlers.connected) client.off("connected", handlers.connected);
     if (handlers.disconnected) client.off("disconnected", handlers.disconnected);
     if (handlers.chat) client.off("chat", handlers.chat);
+    if (handlers.agent) client.off("agent", handlers.agent);
     if (handlers.error) client.off("error", handlers.error);
     handlersRef.current = {};
+  }
+
+  function describeAgentActivity(evt: AgentEvent): string | null {
+    const { stream, data } = evt;
+    if (stream === "tool") {
+      const name = typeof data.name === "string" ? data.name : typeof data.tool === "string" ? data.tool : null;
+      if (name) {
+        const friendly: Record<string, string> = {
+          read_file: "Reading file",
+          write_file: "Writing file",
+          edit_file: "Editing file",
+          list_directory: "Listing directory",
+          search_files: "Searching files",
+          run_command: "Running command",
+          bash: "Running command",
+          web_search: "Searching the web",
+          web_fetch: "Fetching web page",
+          x_search: "Searching X",
+          x_profile: "Looking up profile",
+          x_thread: "Fetching thread",
+          x_user_tweets: "Fetching tweets",
+          google_calendar: "Checking calendar",
+          google_email: "Checking email",
+          memory_search: "Searching memory",
+          memory_store: "Saving to memory",
+        };
+        return friendly[name] || `Using ${name.replace(/_/g, " ")}`;
+      }
+      return "Using tool";
+    }
+    if (stream === "assistant") return "Thinking";
+    if (stream === "lifecycle") {
+      const phase = typeof data.phase === "string" ? data.phase : null;
+      if (phase === "start") return "Starting";
+      if (phase === "end" || phase === "error") return null;
+    }
+    return null;
+  }
+
+  function handleAgentEvent(event: AgentEvent) {
+    if (!event?.runId || event.runId !== activeRunIdRef.current) return;
+    const status = describeAgentActivity(event);
+    if (status) {
+      setThinkingStatus(status);
+    }
   }
 
   function handleChatEvent(event: any) {
@@ -910,70 +1221,106 @@ export function Chat({
       ? { start: composer.selectionStart, end: composer.selectionEnd }
       : null;
 
-    setLastChatEvent(event);
+    lastChatEventRef.current = event;
+    if (showDiagnosticsRef.current || event?.state !== "delta") {
+      setLastChatEvent(event);
+    }
     if (event?.runId) {
       lastEventByRunIdRef.current[event.runId] = Date.now();
     }
-    if (event?.sessionKey && currentSessionRef.current && event.sessionKey !== currentSessionRef.current) {
+    const isActiveRunTerminalEvent = Boolean(
+      event?.runId &&
+      activeRunIdRef.current === event.runId &&
+      (event.state === "final" || event.state === "error" || event.state === "aborted")
+    );
+    if (isActiveRunTerminalEvent) {
+      setIsLoading(false);
+      setThinkingStatus(null);
+      clearActiveRunTracking();
+    }
+    const isActiveRun = Boolean(event?.runId && activeRunIdRef.current === event.runId);
+    const activeRunMatchesCurrentSession = Boolean(
+      isActiveRun &&
+      activeRunSessionRef.current &&
+      currentSessionRef.current &&
+      activeRunSessionRef.current === currentSessionRef.current
+    );
+    if (event?.sessionKey && currentSessionRef.current && event.sessionKey !== currentSessionRef.current && !activeRunMatchesCurrentSession) {
       return;
     }
     if (event.state === "delta" || event.state === "final") {
       const normalized = event.message ? normalizeGatewayMessage(event.message as GatewayMessage, event.runId) : null;
       const text = normalized?.content ?? "";
-      if (!text) return;
-      if (event.runId) {
-        const timings = runTimingsRef.current[event.runId];
-        if (timings && !timings.firstDeltaAt) {
-          timings.firstDeltaAt = Date.now();
-          addDiag(`timing first_delta runId=${event.runId} t=${timings.firstDeltaAt - timings.startedAt}ms`);
+      const hasRenderableAssistantPayload = Boolean(
+        normalized?.assistantPayload &&
+        (normalized.assistantPayload.events.length > 0 || normalized.assistantPayload.errors.length > 0)
+      );
+      if (text || hasRenderableAssistantPayload) {
+        setThinkingStatus(null);
+        if (isProxyAuthFailure(text)) {
+          triggerProxyAuthRecovery("chat message");
         }
-      }
-      setMessages(prev => {
-        const existingIdx = prev.findIndex(m => m.id === event.runId && m.role === "assistant");
-        if (existingIdx >= 0) {
-          const updated = [...prev];
-          updated[existingIdx] = {
-            ...updated[existingIdx],
-            content: text,
-            kind: normalized?.kind ?? updated[existingIdx].kind,
-            toolName: normalized?.toolName ?? updated[existingIdx].toolName,
-            sentAt: updated[existingIdx].sentAt ?? normalized?.sentAt ?? Date.now(),
-          };
-          return updated;
-        }
-        return [
-          ...prev,
-          {
-            id: event.runId,
-            role: "assistant",
-            content: text,
-            kind: normalized?.kind,
-            toolName: normalized?.toolName,
-            sentAt: normalized?.sentAt ?? Date.now(),
-          },
-        ];
-      });
-      if (keepComposerFocus) {
-        requestAnimationFrame(() => {
-          if (!textareaRef.current) return;
-          textareaRef.current.focus();
-          if (selection) {
-            try {
-              textareaRef.current.setSelectionRange(selection.start, selection.end);
-            } catch {
-              // ignore selection restore failures
-            }
+        if (event.runId) {
+          const timings = runTimingsRef.current[event.runId];
+          if (timings && !timings.firstDeltaAt) {
+            timings.firstDeltaAt = Date.now();
+            addDiag(`timing first_delta runId=${event.runId} t=${timings.firstDeltaAt - timings.startedAt}ms`);
           }
+        }
+        setMessages(prev => {
+          const existingIdx = prev.findIndex(m => m.id === event.runId && m.role === "assistant");
+          if (existingIdx >= 0) {
+            const updated = [...prev];
+            updated[existingIdx] = {
+              ...updated[existingIdx],
+              content: text,
+              kind: normalized?.kind ?? updated[existingIdx].kind,
+              toolName: normalized?.toolName ?? updated[existingIdx].toolName,
+              assistantPayload: normalized?.assistantPayload ?? updated[existingIdx].assistantPayload,
+              sentAt: updated[existingIdx].sentAt ?? normalized?.sentAt ?? Date.now(),
+            };
+            return updated;
+          }
+          return [
+            ...prev,
+            {
+              id: event.runId,
+              role: "assistant",
+              content: text,
+              kind: normalized?.kind,
+              toolName: normalized?.toolName,
+              assistantPayload: normalized?.assistantPayload,
+              sentAt: normalized?.sentAt ?? Date.now(),
+            },
+          ];
         });
-      }
-      if (normalized && normalized.kind === "toolResult" && event.runId) {
-        const timings = runTimingsRef.current[event.runId];
-        if (timings && !timings.toolSeenAt) {
-          timings.toolSeenAt = Date.now();
-          addDiag(`timing tool_result runId=${event.runId} t=${timings.toolSeenAt - timings.startedAt}ms`);
+        if (keepComposerFocus) {
+          requestAnimationFrame(() => {
+            if (!textareaRef.current) return;
+            textareaRef.current.focus();
+            if (selection) {
+              try {
+                textareaRef.current.setSelectionRange(selection.start, selection.end);
+              } catch {
+                // ignore selection restore failures
+              }
+            }
+          });
+        }
+        if (normalized && normalized.kind === "toolResult" && event.runId) {
+          const timings = runTimingsRef.current[event.runId];
+          if (timings && !timings.toolSeenAt) {
+            timings.toolSeenAt = Date.now();
+            addDiag(`timing tool_result runId=${event.runId} t=${timings.toolSeenAt - timings.startedAt}ms`);
+          }
         }
       }
-      if (event.state === "final") setIsLoading(false);
+      if (event.state === "final") {
+        setIsLoading(false);
+        if (event.runId && activeRunIdRef.current === event.runId) {
+          clearActiveRunTracking();
+        }
+      }
       if (event.state === "final" && event.runId) {
         const timings = runTimingsRef.current[event.runId];
         if (timings && !timings.finalAt) {
@@ -1001,7 +1348,7 @@ export function Chat({
                 // Merge: gateway sessions take priority, keep local-only sessions
                 const gatewayKeys = new Set(updatedSessions.map(s => s.key));
                 const localOnly = prev.filter(s => !gatewayKeys.has(s.key) && (sessionMessagesRef.current[s.key]?.length ?? 0) > 0);
-                return [...updatedSessions, ...localOnly];
+                return overlaySessionMetadata([...updatedSessions, ...localOnly], prev);
               });
             }
           }).catch(() => {});
@@ -1009,12 +1356,26 @@ export function Chat({
         }
       }
     } else if (event.state === "error") {
-      setError(event.errorMessage || "Chat error");
+      const errorMessage = event.errorMessage || "Chat error";
+      setError(errorMessage);
       setIsLoading(false);
+      if (event.runId && activeRunIdRef.current === event.runId) {
+        clearActiveRunTracking();
+      }
       addDiag(`chat error: ${event.errorMessage || "unknown"}`);
+      if (isProxyAuthFailure(errorMessage)) {
+        triggerProxyAuthRecovery("chat error event");
+      }
     } else if (event.state === "aborted") {
       setIsLoading(false);
+      if (event.runId && activeRunIdRef.current === event.runId) {
+        clearActiveRunTracking();
+      }
       addDiag("chat aborted");
+    }
+
+    if (showDiagnosticsRef.current) {
+      setLastChatEvent(lastChatEventRef.current);
     }
   }
 
@@ -1037,7 +1398,7 @@ export function Chat({
     }
 
     const merged = [...gatewaySessions, ...localOnly];
-    setSessions(merged);
+    setSessions(prev => overlaySessionMetadata(merged, [...(cached?.sessions || []), ...prev]));
 
     // Restore messages cache from persisted data
     if (cached?.messages) {
@@ -1084,7 +1445,7 @@ export function Chat({
         .filter((m: Message | null): m is Message => !!m && m.content.trim().length > 0);
     } else {
       // Fall back to locally cached messages
-      msgs = sessionMessagesRef.current[sessionId] || [];
+      msgs = (sessionMessagesRef.current[sessionId] || []).map(normalizeCachedMessage);
     }
     setMessages(msgs);
     sessionMessagesRef.current[sessionId] = msgs;
@@ -1092,12 +1453,126 @@ export function Chat({
     schedulePersist();
   }
 
-  function createNewSession() {
+  async function applySessionAction(action: ChatSessionActionRequest) {
+    if (!action?.key) return;
+    if (action.type === "pin") {
+      setSessions((prev) =>
+        normalizeSessionsList(
+          prev.map((session) =>
+            session.key === action.key ? { ...session, pinned: action.pinned } : session,
+          ),
+        ),
+      );
+      schedulePersist();
+      return;
+    }
+
+    if (action.type === "rename") {
+      const nextLabel = action.label.trim();
+      if (!nextLabel) return;
+      const existing = sessionsRef.current.find((session) => session.key === action.key);
+      setSessions((prev) =>
+        normalizeSessionsList(
+          prev.map((session) =>
+            session.key === action.key ? { ...session, label: nextLabel } : session,
+          ),
+        ),
+      );
+      schedulePersist();
+      try {
+        await clientRef.current?.patchSession(action.key, { label: nextLabel });
+      } catch (err) {
+        addDiag(`rename failed key=${action.key}: ${String(err)}`);
+        setError("Failed to rename chat");
+        if (existing) {
+          setSessions((prev) =>
+            normalizeSessionsList(
+              prev.map((session) =>
+                session.key === action.key ? { ...session, label: existing.label } : session,
+              ),
+            ),
+          );
+          schedulePersist();
+        }
+      }
+      return;
+    }
+
+    if (action.type === "delete") {
+      const snapshotSession = sessionsRef.current.find((session) => session.key === action.key);
+      const snapshotMessages = sessionMessagesRef.current[action.key] || [];
+      const snapshotDraft = draftsRef.current[action.key] || "";
+      const deletingCurrent = currentSessionRef.current === action.key;
+      const remaining = normalizeSessionsList(
+        sessionsRef.current.filter((session) => session.key !== action.key),
+      );
+
+      setSessions(remaining);
+      const nextMessages = { ...sessionMessagesRef.current };
+      delete nextMessages[action.key];
+      sessionMessagesRef.current = nextMessages;
+      setDraftsBySession((prev) => {
+        const next = { ...prev };
+        delete next[action.key];
+        return next;
+      });
+      schedulePersist();
+
+      if (deletingCurrent) {
+        if (remaining.length > 0) {
+          await selectSession(remaining[0].key);
+        } else {
+          createNewSession({ force: true });
+        }
+      }
+
+      try {
+        await clientRef.current?.deleteSession(action.key, true);
+      } catch (err) {
+        addDiag(`delete failed key=${action.key}: ${String(err)}`);
+        setError("Failed to delete chat");
+        if (snapshotSession) {
+          setSessions((prev) => normalizeSessionsList([...prev, snapshotSession]));
+          if (snapshotMessages.length > 0) {
+            sessionMessagesRef.current[action.key] = snapshotMessages;
+          }
+          if (snapshotDraft) {
+            setDraftsBySession((prev) => ({ ...prev, [action.key]: snapshotDraft }));
+          }
+          schedulePersist();
+          if (deletingCurrent) {
+            await selectSession(action.key);
+          }
+        }
+      }
+    }
+  }
+
+  function createNewSession(options?: { force?: boolean }) {
+    const force = options?.force === true;
+    const existing = currentSessionRef.current;
+    if (!force && existing && sessionsRef.current.some((session) => session.key === existing)) {
+      const existingMessages = sessionMessagesRef.current[existing] || [];
+      const existingDraft = draftsRef.current[existing] || "";
+      if (existingMessages.length === 0 && existingDraft.trim().length === 0) {
+        setCurrentSession(existing);
+        setMessages([]);
+        setShowWelcome(true);
+        return;
+      }
+    }
+
     const sessionKey = clientRef.current?.createSessionKey() || crypto.randomUUID();
     currentSessionRef.current = sessionKey;
     setCurrentSession(sessionKey);
     setMessages([]);
     sessionMessagesRef.current[sessionKey] = [];
+    setSessions((prev) => {
+      if (prev.some((session) => session.key === sessionKey)) {
+        return prev;
+      }
+      return normalizeSessionsList([{ key: sessionKey, updatedAt: Date.now() }, ...prev]);
+    });
     setDraftsBySession((prev) => ({ ...prev, [sessionKey]: "" }));
     setShowWelcome(true);
     schedulePersist();
@@ -1120,8 +1595,10 @@ export function Chat({
       sessionMessagesRef.current[currentSession] = [...cachedMsgs, userMessage];
       // Ensure this session is in the sessions list
       setSessions(prev => {
-        if (prev.find(s => s.key === currentSession)) return prev;
-        return [{ key: currentSession, updatedAt: Date.now() }, ...prev];
+        const updated = prev.some((s) => s.key === currentSession)
+          ? prev.map((s) => (s.key === currentSession ? { ...s, updatedAt: Date.now() } : s))
+          : [{ key: currentSession, updatedAt: Date.now() }, ...prev];
+        return normalizeSessionsList(updated);
       });
       schedulePersist();
     }
@@ -1131,6 +1608,7 @@ export function Chat({
     }
     setShowWelcome(false);
     setIsLoading(true);
+    setThinkingStatus("Thinking");
     setError(null);
     try {
       const routingEnabled = import.meta.env.VITE_MODEL_ROUTING === "1";
@@ -1148,31 +1626,35 @@ export function Chat({
       if (routingEnabled && chosenModel && currentSession && clientRef.current) {
         const lastModel = sessionModelRef.current[currentSession];
         if (lastModel !== chosenModel) {
-          try {
-            await clientRef.current.patchSession(currentSession, { model: chosenModel });
-            sessionModelRef.current[currentSession] = chosenModel;
-            addDiag(`routing model=${chosenModel} reason=${decision.reason}`);
-          } catch (err) {
-            addDiag(`routing patch failed: ${String(err)}`);
-          }
+          sessionModelRef.current[currentSession] = chosenModel;
+          clientRef.current.patchSession(currentSession, { model: chosenModel }).then(
+            () => addDiag(`routing model=${chosenModel} reason=${decision.reason}`),
+            (err: unknown) => addDiag(`routing patch failed: ${String(err)}`),
+          );
         }
       }
       const sendStart = Date.now();
       const now = Date.now();
       if (gatewayRunning && (connectedProvider || proxyEnabled) && now - lastIntegrationsSyncRef.current > 60_000) {
-        try {
-          const providers = await syncAllIntegrationsToGateway();
-          lastIntegrationsSyncRef.current = now;
-          addDiag(`integrations synced before send: ${providers.length ? providers.join(", ") : "none"}`);
-        } catch (err) {
-          addDiag(`integrations sync before send failed: ${String(err)}`);
-        }
+        lastIntegrationsSyncRef.current = now;
+        syncAllIntegrationsToGateway().then(
+          (providers) => addDiag(`integrations synced: ${providers.length ? providers.join(", ") : "none"}`),
+          (err: unknown) => addDiag(`integrations sync failed: ${String(err)}`),
+        );
       }
       addDiag(`send -> session=${currentSession} len=${messageContent.length}`);
-      const runId = await clientRef.current?.sendMessage(currentSession, messageContent, []);
+      const client = clientRef.current;
+      if (!client || !client.isConnected()) {
+        throw new Error("Gateway disconnected. Reconnecting...");
+      }
+      const runId = await client.sendMessage(currentSession, messageContent, []);
+      if (!runId) {
+        throw new Error("Failed to start response stream");
+      }
       setLastSendId(runId || null);
       setLastSendAt(Date.now());
       if (runId) {
+        scheduleActiveRunTimeout(runId, currentSession);
         runTimingsRef.current[runId] = { startedAt: sendStart, ackAt: Date.now() };
         addDiag(`timing send_ack runId=${runId} t=${runTimingsRef.current[runId].ackAt! - sendStart}ms`);
         addDiag(`send ok runId=${runId}`);
@@ -1190,6 +1672,7 @@ export function Chat({
     } catch (e) {
       setError(e instanceof Error ? e.message : "Send failed");
       setIsLoading(false);
+      clearActiveRunTracking();
       addDiag(`send failed: ${e instanceof Error ? e.message : "unknown"}`);
       if (failedDraftRestore !== null && sendSession && currentSessionRef.current === sendSession) {
         setDraftsBySession((prev) => ({ ...prev, [sendSession]: failedDraftRestore }));
@@ -1262,7 +1745,12 @@ export function Chat({
   type AssistantRenderPayload = ReturnType<typeof parseToolPayloads>;
 
   function renderAssistantContent(message: Message, precomputedPayload?: AssistantRenderPayload) {
-    const payload = precomputedPayload ?? parseToolPayloads(sanitizeAssistantDisplayContent(message.content));
+    const payload = precomputedPayload ?? {
+      cleanText: message.content,
+      events: message.assistantPayload?.events ?? [],
+      errors: message.assistantPayload?.errors ?? [],
+      hadToolPayload: message.assistantPayload?.hadToolPayload ?? false,
+    };
     if (payload.hadToolPayload && message.id) {
       const timings = runTimingsRef.current[message.id];
       if (timings && !timings.toolSeenAt) {
@@ -1544,7 +2032,12 @@ export function Chat({
           {messages.map(msg => {
             const normalizedUser = msg.role === "user" ? normalizeUserContent(msg.content, msg.sentAt) : null;
             const assistantPayload = msg.role === "assistant"
-              ? parseToolPayloads(sanitizeAssistantDisplayContent(msg.content))
+              ? {
+                  cleanText: msg.content,
+                  events: msg.assistantPayload?.events ?? [],
+                  errors: msg.assistantPayload?.errors ?? [],
+                  hadToolPayload: msg.assistantPayload?.hadToolPayload ?? false,
+                }
               : null;
             const bodyContent = msg.role === "user" ? normalizedUser?.content ?? "" : msg.content;
             const messageTime = formatMessageTime(msg.role === "user" ? normalizedUser?.sentAt : msg.sentAt);
@@ -1583,8 +2076,11 @@ export function Chat({
           })}
           {isLoading && (
             <div className="flex justify-start">
-              <div className="px-4 py-2.5 rounded-2xl bg-[var(--bg-tertiary)]">
-                <Loader2 className="w-5 h-5 animate-spin text-[var(--text-tertiary)]" />
+              <div className="px-4 py-2.5 rounded-2xl bg-[var(--bg-tertiary)] flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin text-[var(--text-tertiary)]" />
+                <span className="text-sm text-[var(--text-secondary)] animate-pulse">
+                  {thinkingStatus || "Thinking"}
+                </span>
               </div>
             </div>
           )}

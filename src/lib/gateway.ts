@@ -59,10 +59,20 @@ type Session = {
   updatedAt: number | null;
 };
 
+export type AgentEvent = {
+  runId: string;
+  seq: number;
+  stream: "lifecycle" | "tool" | "assistant" | "error" | string;
+  ts: number;
+  sessionKey?: string;
+  data: Record<string, unknown>;
+};
+
 type GatewayEvents = {
   connected: () => void;
   disconnected: () => void;
   chat: (event: ChatEvent) => void;
+  agent: (event: AgentEvent) => void;
   error: (error: string) => void;
 };
 
@@ -167,6 +177,8 @@ export class GatewayClient {
         }
       } else if (frame.event === "chat") {
         this.emit("chat", frame.payload as ChatEvent);
+      } else if (frame.event === "agent") {
+        this.emit("agent", frame.payload as AgentEvent);
       }
     } else if (frame.type === "res") {
       const pending = this.pendingRequests.get(frame.id);
@@ -258,8 +270,19 @@ export class GatewayClient {
     await this.rpc("sessions.reset", { key: sessionKey });
   }
 
-  async patchSession(sessionKey: string, patch: { model?: string | null }): Promise<void> {
+  async patchSession(
+    sessionKey: string,
+    patch: { model?: string | null; label?: string | null },
+  ): Promise<void> {
     await this.rpc("sessions.patch", { key: sessionKey, ...patch });
+  }
+
+  async deleteSession(sessionKey: string, deleteTranscript = true): Promise<boolean> {
+    const result = await this.rpc<{ deleted?: boolean }>("sessions.delete", {
+      key: sessionKey,
+      deleteTranscript,
+    });
+    return result?.deleted ?? true;
   }
 
   async getConfig(): Promise<unknown> {

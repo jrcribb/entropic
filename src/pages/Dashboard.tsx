@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Loader2 } from "lucide-react";
 import { Layout, Page } from "../components/Layout";
-import { Chat, type ChatSession } from "./Chat";
+import { Chat, type ChatSession, type ChatSessionActionRequest } from "./Chat";
 import { Store } from "./Store";
 import { Channels } from "./Channels";
 import { Files } from "./Files";
@@ -58,6 +58,7 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [currentChatSession, setCurrentChatSession] = useState<string | null>(null);
   const [pendingChatSession, setPendingChatSession] = useState<string | null>(null);
+  const [pendingChatAction, setPendingChatAction] = useState<ChatSessionActionRequest | null>(null);
   const gatewayTokenRef = useRef<string | null>(null);
   const autoStartAttemptedRef = useRef(false);
   const retryAttemptRef = useRef(0);
@@ -522,8 +523,10 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
               setChatSessions(sessions);
               setCurrentChatSession(currentKey);
               setPendingChatSession(null);
+              setPendingChatAction(null);
             }}
             requestedSession={pendingChatSession}
+            requestedSessionAction={pendingChatAction}
           />
         );
         }
@@ -653,6 +656,10 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
       }}
       onNewChat={() => {
         setPendingChatSession("__new__");
+        setCurrentPage("chat");
+      }}
+      onChatSessionAction={(action) => {
+        setPendingChatAction({ id: crypto.randomUUID(), ...action });
         setCurrentPage("chat");
       }}
     >
