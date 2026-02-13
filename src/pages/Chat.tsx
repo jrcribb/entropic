@@ -21,6 +21,11 @@ type Message = {
   kind?: "toolResult";
   toolName?: string;
   sentAt?: number | null;
+  assistantPayload?: {
+    events: CalendarEvent[];
+    errors: ToolError[];
+    hadToolPayload: boolean;
+  };
 };
 export type ChatSession = { key: string; label?: string; displayName?: string; derivedTitle?: string; updatedAt?: number | null };
 type Provider = { id: string; name: string; icon: string; placeholder: string; keyUrl: string };
@@ -348,6 +353,123 @@ function stripConversationMetadata(raw: string): string {
   return text.trimStart();
 }
 
+function stripInlineClawdbotMetadata(raw: string): string {
+  let result = "";
+  let cursor = 0;
+
+  while (cursor < raw.length) {
+    const remaining = raw.slice(cursor);
+    const match = /metadata\s*:/i.exec(remaining);
+    if (!match) {
+      result += remaining;
+      break;
+    }
+
+    const matchStart = cursor + match.index;
+    const labelEnd = matchStart + match[0].length;
+    result += raw.slice(cursor, matchStart);
+
+    let i = labelEnd;
+    while (i < raw.length && /\s/.test(raw[i])) i += 1;
+    if (raw[i] !== "{") {
+      result += raw.slice(matchStart, labelEnd);
+      cursor = labelEnd;
+      continue;
+    }
+
+    const objectStart = i;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let objectEnd = -1;
+
+    for (; i < raw.length; i += 1) {
+      const ch = raw[i];
+      if (inString) {
+        if (escape) {
+          escape = false;
+        } else if (ch === "\\") {
+          escape = true;
+        } else if (ch === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === "\"") {
+        inString = true;
+        continue;
+      }
+      if (ch === "{") depth += 1;
+      if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          objectEnd = i;
+          break;
+        }
+      }
+    }
+
+    if (objectEnd < 0) {
+      result += raw.slice(matchStart);
+      break;
+    }
+
+    const objectText = raw.slice(objectStart, objectEnd + 1);
+    if (/[\"']?clawdbot[\"']?\s*:/i.test(objectText)) {
+      cursor = objectEnd + 1;
+      while (cursor < raw.length && raw[cursor] === " ") cursor += 1;
+      continue;
+    }
+
+    result += raw.slice(matchStart, objectEnd + 1);
+    cursor = objectEnd + 1;
+  }
+
+  return result;
+}
+
+function sanitizeAssistantDisplayContent(raw: string): string {
+  if (!raw) return "";
+  let text = stripConversationMetadata(raw);
+
+  // Hide OpenClaw internal skill manifest metadata payloads (machine format).
+  text = text.replace(
+    /^\s*metadata:\s*\{[\s\S]*?"clawdbot"[\s\S]*?\}\s*$/gim,
+    ""
+  );
+  text = text.replace(
+    /^\s*metadata:\s*(?:\r?\n[ \t]+[^\n]*)+/gim,
+    (block) => (/(?:^|\n)\s*clawdbot\s*:/i.test(block) ? "" : block)
+  );
+  text = stripInlineClawdbotMetadata(text);
+
+  return text.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function buildAssistantPayload(raw: string) {
+  const cleaned = sanitizeAssistantDisplayContent(raw);
+  const parsed = parseToolPayloads(cleaned);
+  return {
+    content: parsed.cleanText,
+    assistantPayload: {
+      events: parsed.events,
+      errors: parsed.errors,
+      hadToolPayload: parsed.hadToolPayload,
+    },
+  };
+}
+
+function normalizeCachedMessage(message: Message): Message {
+  if (message.role !== "assistant") return message;
+  if (message.assistantPayload) return message;
+  const prepared = buildAssistantPayload(message.content || "");
+  return {
+    ...message,
+    content: prepared.content,
+    assistantPayload: prepared.assistantPayload,
+  };
+}
+
 function parseUtcBracketTimestamp(raw: string): { text: string; sentAt: number | null } {
   if (!raw) return { text: "", sentAt: null };
   const match = raw.match(/^\s*\[[A-Za-z]{3}\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}(?::\d{2})?)\s+UTC\]\s*/);
@@ -469,10 +591,10 @@ function normalizeGatewayMessage(message: GatewayMessage, id: string): Message |
   if (roleRaw === "assistant") {
     if (!hasText && !hasNonText) return null;
     if (!hasText) return null;
-    return { id, role: "assistant", content: text, sentAt: messageTimestamp };
-  }
-  if (roleRaw === "toolresult" || roleRaw === "tool_result" || roleRaw === "tool") {
-    if (!hasText) return null;
+    const prepared = buildAssistantPayload(text);
+    if (!prepared.content && prepared.assistantPayload.events.length === 0 && prepared.assistantPayload.errors.length === 0) {
+      return null;
+    }
     return {
       id,
       role: "assistant",
@@ -493,6 +615,7 @@ function normalizeGatewayMessage(message: GatewayMessage, id: string): Message |
       content: prepared.content,
       kind: "toolResult",
       toolName: typeof message.toolName === "string" ? message.toolName : undefined,
+      assistantPayload: prepared.assistantPayload,
       sentAt: messageTimestamp,
     };
   }
@@ -659,9 +782,6 @@ export function Chat({
   const restoredFromCacheRef = useRef(false);
   const lastChatEventRef = useRef<ChatEvent | null>(null);
   const showDiagnosticsRef = useRef(false);
-  const activeRunIdRef = useRef<string | null>(null);
-  const activeRunSessionRef = useRef<string | null>(null);
-  const activeRunTimeoutRef = useRef<number | null>(null);
 
   function isProxyAuthFailure(message?: string | null): boolean {
     if (!message) return false;
@@ -714,51 +834,6 @@ export function Chat({
       setLastChatEvent(lastChatEventRef.current);
     }
   }, [showDiagnostics]);
-
-  function isProxyAuthFailure(message?: string | null): boolean {
-    if (!message) return false;
-    const text = message.toLowerCase();
-    if (text.includes("invalid gateway token")) return true;
-    if (text.includes("gateway token validation failed")) return true;
-    if (text.includes("ai provider error: 401")) return true;
-    const has401 = text.includes("401") || text.includes("unauthorized");
-    const looksProxy = text.includes("chat/completions") || text.includes("ai provider");
-    return has401 && looksProxy;
-  }
-
-  function triggerProxyAuthRecovery(source: string) {
-    if (!proxyEnabled || !onRecoverProxyAuth) return;
-    const now = Date.now();
-    const recoveryCooldownMs = 30_000;
-    const inCooldown = now - lastProxyAuthRecoveryAtRef.current < recoveryCooldownMs;
-    if (proxyAuthRecoveryInFlightRef.current || inCooldown) {
-      addDiag(`proxy auth recovery skipped (${source}; already in progress or cooldown)`);
-      return;
-    }
-
-    proxyAuthRecoveryInFlightRef.current = true;
-    lastProxyAuthRecoveryAtRef.current = now;
-    setError("Proxy session expired. Reconnecting securely...");
-    addDiag(`proxy auth failure detected from ${source}; refreshing gateway token`);
-
-    Promise.resolve(onRecoverProxyAuth())
-      .then((ok) => {
-        if (ok) {
-          setError("Proxy session refreshed. Please resend your last message.");
-          addDiag("proxy auth recovery succeeded");
-        } else {
-          setError("Failed to refresh proxy session. Retry from Settings > Gateway.");
-          addDiag("proxy auth recovery failed");
-        }
-      })
-      .catch((err) => {
-        setError("Failed to refresh proxy session. Retry from Settings > Gateway.");
-        addDiag(`proxy auth recovery error: ${String(err)}`);
-      })
-      .finally(() => {
-        proxyAuthRecoveryInFlightRef.current = false;
-      });
-  }
 
   useEffect(() => {
     invoke<{
@@ -902,16 +977,6 @@ export function Chat({
       void selectSession(requestedSession);
     }
   }, [requestedSession, currentSession]);
-
-  useEffect(() => {
-    if (!requestedSessionAction) {
-      handledRequestedActionRef.current = null;
-      return;
-    }
-    if (handledRequestedActionRef.current === requestedSessionAction.id) return;
-    handledRequestedActionRef.current = requestedSessionAction.id;
-    void applySessionAction(requestedSessionAction);
-  }, [requestedSessionAction]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: isLoading ? "auto" : "smooth" });
@@ -1150,7 +1215,11 @@ export function Chat({
     if (event.state === "delta" || event.state === "final") {
       const normalized = event.message ? normalizeGatewayMessage(event.message as GatewayMessage, event.runId) : null;
       const text = normalized?.content ?? "";
-      if (text) {
+      const hasRenderableAssistantPayload = Boolean(
+        normalized?.assistantPayload &&
+        (normalized.assistantPayload.events.length > 0 || normalized.assistantPayload.errors.length > 0)
+      );
+      if (text || hasRenderableAssistantPayload) {
         if (isProxyAuthFailure(text)) {
           triggerProxyAuthRecovery("chat message");
         }
@@ -1170,6 +1239,7 @@ export function Chat({
               content: text,
               kind: normalized?.kind ?? updated[existingIdx].kind,
               toolName: normalized?.toolName ?? updated[existingIdx].toolName,
+              assistantPayload: normalized?.assistantPayload ?? updated[existingIdx].assistantPayload,
               sentAt: updated[existingIdx].sentAt ?? normalized?.sentAt ?? Date.now(),
             };
             return updated;
@@ -1182,6 +1252,7 @@ export function Chat({
               content: text,
               kind: normalized?.kind,
               toolName: normalized?.toolName,
+              assistantPayload: normalized?.assistantPayload,
               sentAt: normalized?.sentAt ?? Date.now(),
             },
           ];
@@ -1915,6 +1986,14 @@ export function Chat({
           ) : null}
           {messages.map(msg => {
             const normalizedUser = msg.role === "user" ? normalizeUserContent(msg.content, msg.sentAt) : null;
+            const assistantPayload = msg.role === "assistant"
+              ? {
+                  cleanText: msg.content,
+                  events: msg.assistantPayload?.events ?? [],
+                  errors: msg.assistantPayload?.errors ?? [],
+                  hadToolPayload: msg.assistantPayload?.hadToolPayload ?? false,
+                }
+              : null;
             const bodyContent = msg.role === "user" ? normalizedUser?.content ?? "" : msg.content;
             const messageTime = formatMessageTime(msg.role === "user" ? normalizedUser?.sentAt : msg.sentAt);
             if (msg.role === "user" && !bodyContent) {
