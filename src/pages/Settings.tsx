@@ -7,6 +7,7 @@ import { loadProfile, saveProfile, type AgentProfile } from "../lib/profile";
 import { useAuth } from "../contexts/AuthContext";
 import { ModelSelector } from "../components/ModelSelector";
 import { WALLPAPERS, DEFAULT_WALLPAPER_ID, getWallpaperById } from "../lib/wallpapers";
+import { getProxyUrl } from "../lib/auth";
 
 type Props = {
   gatewayRunning: boolean;
@@ -288,6 +289,35 @@ export function Settings({
               className={clsx(
                 "pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out",
                 (gatewayRunning || isTogglingGateway) ? "translate-x-5" : "translate-x-0"
+              )}
+            />
+          </button>
+        </SettingsRow>
+
+        <SettingsRow
+          label="Use Local Keys"
+          icon={Key}
+          description={
+            useLocalKeys
+              ? "Local provider keys in the gateway container"
+              : proxyEnabled
+                ? `Proxy mode via ${getProxyUrl()}`
+                : isAuthConfigured
+                  ? "Sign in to enable proxy mode"
+                  : "Auth not configured; local keys only"
+          }
+        >
+          <button
+            onClick={() => onUseLocalKeysChange(!useLocalKeys)}
+            className={clsx(
+              "relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none",
+              useLocalKeys ? "bg-[var(--system-blue)]" : "bg-[var(--system-gray-4)]"
+            )}
+          >
+            <span
+              className={clsx(
+                "pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out",
+                useLocalKeys ? "translate-x-5" : "translate-x-0"
               )}
             />
           </button>

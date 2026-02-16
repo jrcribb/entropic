@@ -360,7 +360,8 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
 
       if (isNetwork) {
         setStartupError({
-          message: "Can’t reach the Nova backend. Check your connection or switch to Local Keys.",
+          message:
+            "Can’t reach the Nova backend from the app (network/API error). Check backend availability and local proxy settings.",
           actions: [
             { label: "Retry", onClick: () => startGatewayProxyFlow({ model, image, stopFirst, allowRetry: false }) },
             { label: "Use Local Keys", onClick: () => persistUseLocalKeys(true) },
@@ -487,8 +488,8 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
             allowRetry: false,
           });
           if (!started) {
-            console.error("[Nova] Proxy mode failed, falling back to direct.");
-            await invoke("start_gateway");
+            console.error("[Nova] Proxy mode failed; not falling back to local mode.");
+            return;
           }
         } else {
           // Not authenticated, use direct API keys
@@ -789,6 +790,29 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
                 )}
               </div>
             )}
+          </div>
+        </div>
+      )}
+      {!showGatewayStartup && startupError && (
+        <div className="absolute right-4 top-4 z-40 w-[min(28rem,calc(100%-2rem))] rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800 shadow-lg">
+          <div className="font-medium">Gateway Start Failed</div>
+          <div className="mt-1 text-xs">{startupError.message}</div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {startupError.actions && startupError.actions.length > 0 && startupError.actions.map((action) => (
+              <button
+                key={action.label}
+                className="rounded-full border border-red-200 bg-white px-3 py-1 text-xs text-red-700 hover:bg-red-100"
+                onClick={action.onClick}
+              >
+                {action.label}
+              </button>
+            ))}
+            <button
+              className="rounded-full border border-red-200 bg-white px-3 py-1 text-xs text-red-700 hover:bg-red-100"
+              onClick={() => setStartupError(null)}
+            >
+              Dismiss
+            </button>
           </div>
         </div>
       )}

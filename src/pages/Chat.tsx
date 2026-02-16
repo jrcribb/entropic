@@ -820,6 +820,7 @@ export function Chat({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const clientRef = useRef<GatewayClient | null>(null);
+  const connectInFlightRef = useRef(false);
   const currentSessionRef = useRef<string | null>(null);
   const draftsRef = useRef<Record<string, string>>({});
   const handledRequestedSessionRef = useRef<string | null>(null);
@@ -1196,23 +1197,34 @@ export function Chat({
     addDiag(`status proxy=${proxyEnabled} gatewayRunning=${gatewayRunning}`);
   }, [proxyEnabled, gatewayRunning]);
 
-  // Simplified connection effect
+  // Keep a single gateway socket alive while gateway + provider are available.
   useEffect(() => {
-    if (gatewayStarting) {
-      clientRef.current?.disconnect();
-      clientRef.current = null;
+    const shouldConnect = gatewayRunning && !gatewayStarting && (connectedProvider || proxyEnabled);
+    if (!shouldConnect) {
+      if (clientRef.current) {
+        detachGatewayListeners(clientRef.current);
+        clientRef.current.disconnect();
+        clientRef.current = null;
+      }
+      setConnected(false);
+      connectInFlightRef.current = false;
       return;
     }
-    if (gatewayRunning && (connectedProvider || proxyEnabled) && !clientRef.current) {
-      connectToGateway();
+    if (!clientRef.current && !connectInFlightRef.current) {
+      void connectToGateway();
     }
+  }, [gatewayRunning, gatewayStarting, connectedProvider, proxyEnabled]);
+
+  useEffect(() => {
     return () => {
       if (clientRef.current) {
         detachGatewayListeners(clientRef.current);
+        clientRef.current.disconnect();
         clientRef.current = null;
       }
+      connectInFlightRef.current = false;
     };
-  }, [gatewayRunning, gatewayStarting, connectedProvider, proxyEnabled]);
+  }, []);
 
   useEffect(() => {
     if (gatewayStarting) {
@@ -1227,7 +1239,21 @@ export function Chat({
     }
   }, [isConnecting]);
 
+  useEffect(() => {
+    if (!connected) return;
+    if (currentSessionRef.current) return;
+    if (sessionsRef.current.length > 0) {
+      void selectSession(sessionsRef.current[0].key);
+      addDiag("auto-selected first session after connect");
+      return;
+    }
+    createNewSession();
+    addDiag("auto-created session after connect");
+  }, [connected]);
+
   async function connectToGateway() {
+    if (connectInFlightRef.current) return;
+    connectInFlightRef.current = true;
     setIsConnecting(true);
     setError(null);
     try {
@@ -1238,6 +1264,10 @@ export function Chat({
       }
       addDiag(`connect -> ${wsUrl}`);
       const client = createGatewayClient(wsUrl, auth.token);
+      if (clientRef.current && clientRef.current !== client) {
+        detachGatewayListeners(clientRef.current);
+        clientRef.current.disconnect();
+      }
       clientRef.current = client;
       detachGatewayListeners(client);
       const onConnected = () => {
@@ -1306,6 +1336,8 @@ export function Chat({
       }
       setIsConnecting(false);
       addDiag(`connect failed: ${e instanceof Error ? e.message : "unknown"}`);
+    } finally {
+      connectInFlightRef.current = false;
     }
   }
 
@@ -1378,14 +1410,17 @@ export function Chat({
     if (event?.runId) {
       lastEventByRunIdRef.current[event.runId] = Date.now();
     }
+    const eventSessionKey =
+      typeof event?.sessionKey === "string" ? event.sessionKey.trim() : "";
+    const isActiveRun = Boolean(event?.runId && activeRunIdRef.current === event.runId);
     if (
-      event?.runId &&
-      activeRunIdRef.current === event.runId &&
-      event?.sessionKey &&
+      isActiveRun &&
+      eventSessionKey &&
+      eventSessionKey !== "unknown" &&
       activeRunSessionRef.current &&
-      event.sessionKey !== activeRunSessionRef.current
+      eventSessionKey !== activeRunSessionRef.current
     ) {
-      migrateSessionKey(activeRunSessionRef.current, event.sessionKey);
+      migrateSessionKey(activeRunSessionRef.current, eventSessionKey);
     }
     const isActiveRunTerminalEvent = Boolean(
       event?.runId &&
@@ -1397,14 +1432,12 @@ export function Chat({
       setThinkingStatus(null);
       clearActiveRunTracking();
     }
-    const isActiveRun = Boolean(event?.runId && activeRunIdRef.current === event.runId);
-    const activeRunMatchesCurrentSession = Boolean(
-      isActiveRun &&
-      activeRunSessionRef.current &&
+    if (
+      !isActiveRun &&
+      eventSessionKey &&
       currentSessionRef.current &&
-      activeRunSessionRef.current === currentSessionRef.current
-    );
-    if (event?.sessionKey && currentSessionRef.current && event.sessionKey !== currentSessionRef.current && !activeRunMatchesCurrentSession) {
+      eventSessionKey !== currentSessionRef.current
+    ) {
       return;
     }
     if (event.state === "delta" || event.state === "final") {
@@ -1814,25 +1847,29 @@ export function Chat({
   }
 
   async function handleSend(content?: string) {
-    const sendSession = currentSession;
+    let sendSession = currentSessionRef.current;
+    if (!sendSession) {
+      createNewSession({ force: true });
+      sendSession = currentSessionRef.current;
+    }
     const currentDraft = sendSession ? (draftsRef.current[sendSession] || "") : "";
     const messageContent = content || currentDraft.trim();
     const failedDraftRestore = content ? null : currentDraft;
-    if (!currentSession || !connected || isLoading || (!messageContent && pendingAttachments.length === 0)) return;
+    if (!sendSession || !connected || isLoading || (!messageContent && pendingAttachments.length === 0)) return;
 
     const userMessage: Message = { id: crypto.randomUUID(), role: "user", content: messageContent, sentAt: Date.now() };
-    visibleMessagesSessionRef.current = currentSession;
+    visibleMessagesSessionRef.current = sendSession;
     setMessages(prev => [...prev, userMessage]);
 
     // Persist the user message immediately so it survives navigation
-    if (currentSession) {
-      const cachedMsgs = sessionMessagesRef.current[currentSession] || [];
-      sessionMessagesRef.current[currentSession] = [...cachedMsgs, userMessage];
+    if (sendSession) {
+      const cachedMsgs = sessionMessagesRef.current[sendSession] || [];
+      sessionMessagesRef.current[sendSession] = [...cachedMsgs, userMessage];
       // Ensure this session is in the sessions list
       setSessions(prev => {
-        const updated = prev.some((s) => s.key === currentSession)
-          ? prev.map((s) => (s.key === currentSession ? { ...s, updatedAt: Date.now() } : s))
-          : [{ key: currentSession, updatedAt: Date.now() }, ...prev];
+        const updated = prev.some((s) => s.key === sendSession)
+          ? prev.map((s) => (s.key === sendSession ? { ...s, updatedAt: Date.now() } : s))
+          : [{ key: sendSession, updatedAt: Date.now() }, ...prev];
         return applySessionTitles(normalizeSessionsList(updated));
       });
       schedulePersist();
@@ -1877,19 +1914,19 @@ export function Chat({
           (err: unknown) => addDiag(`integrations sync failed: ${String(err)}`),
         );
       }
-      addDiag(`send -> session=${currentSession} len=${messageContent.length}`);
+      addDiag(`send -> session=${sendSession} len=${messageContent.length}`);
       const client = clientRef.current;
       if (!client || !client.isConnected()) {
         throw new Error("Gateway disconnected. Reconnecting...");
       }
-      const runId = await client.sendMessage(currentSession, messageContent, []);
+      const runId = await client.sendMessage(sendSession, messageContent, []);
       if (!runId) {
         throw new Error("Failed to start response stream");
       }
       setLastSendId(runId || null);
       setLastSendAt(Date.now());
       if (runId) {
-        scheduleActiveRunTimeout(runId, currentSession);
+        scheduleActiveRunTimeout(runId, sendSession);
         runTimingsRef.current[runId] = { startedAt: sendStart, ackAt: Date.now() };
         addDiag(`timing send_ack runId=${runId} t=${runTimingsRef.current[runId].ackAt! - sendStart}ms`);
         addDiag(`send ok runId=${runId}`);

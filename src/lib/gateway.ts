@@ -80,6 +80,7 @@ export class GatewayClient {
   private ws: WebSocket | null = null;
   private url: string;
   private token: string;
+  private authenticated = false;
   private requestId = 0;
   private pendingRequests = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private listeners: Partial<{ [K in keyof GatewayEvents]: GatewayEvents[K][] }> = {};
@@ -116,6 +117,7 @@ export class GatewayClient {
     return new Promise((resolve, reject) => {
       console.log("[Gateway] Connecting to", this.url);
       this.ws = new WebSocket(this.url);
+      this.authenticated = false;
 
       this.ws.onopen = () => {
         console.log("[Gateway] WebSocket opened, waiting for challenge...");
@@ -138,6 +140,7 @@ export class GatewayClient {
 
       this.ws.onclose = () => {
         console.log("[Gateway] WebSocket closed");
+        this.authenticated = false;
         this.emit("disconnected");
         this.ws = null;
       };
@@ -169,6 +172,7 @@ export class GatewayClient {
             auth: { token: this.token },
           });
           console.log("[Gateway] Connected successfully");
+          this.authenticated = true;
           this.emit("connected");
           connectResolve?.();
         } catch (e) {
@@ -199,6 +203,10 @@ export class GatewayClient {
         reject(new Error("Not connected"));
         return;
       }
+      if (!this.authenticated && method !== "connect") {
+        reject(new Error("Not authenticated"));
+        return;
+      }
 
       const id = String(++this.requestId);
       const frame: RequestFrame = { type: "req", id, method, params };
@@ -220,7 +228,7 @@ export class GatewayClient {
   }
 
   isConnected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.ws?.readyState === WebSocket.OPEN && this.authenticated;
   }
 
   // API Methods
@@ -448,22 +456,13 @@ export type CronRunLogEntry = {
   ts?: number;
 };
 
-// Singleton instance
-let client: GatewayClient | null = null;
-let clientConfig: { url: string; token: string } | null = null;
-
 export function getGatewayClient(): GatewayClient | null {
-  return client;
+  return null;
 }
 
 export function createGatewayClient(url: string, token: string): GatewayClient {
-  if (client && clientConfig?.url === url && clientConfig?.token === token) {
-    return client;
-  }
-  if (client) {
-    client.disconnect();
-  }
-  client = new GatewayClient(url, token);
-  clientConfig = { url, token };
-  return client;
+  // Return an isolated client for each caller. Sharing a singleton across
+  // chat/files/tasks/integration sync causes websocket handshake races where
+  // connect is no longer the first request on a reused socket.
+  return new GatewayClient(url, token);
 }

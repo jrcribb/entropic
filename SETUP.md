@@ -125,6 +125,31 @@ sg docker -c "docker rm -f nova-openclaw"
 pnpm tauri dev
 ```
 
+### Dev Runtime Helpers
+
+```bash
+pnpm dev:runtime:status   # Check Colima, Docker socket, nova-openclaw state
+pnpm dev:runtime:start    # Ensure Colima runtime is started (if installed), verify Docker
+pnpm dev:runtime:up       # Run start and launch `pnpm tauri:dev`
+pnpm dev:runtime:stop     # Stop nova-openclaw + scanner without removing volumes
+pnpm dev:runtime:prune    # Remove nova-openclaw, nova-skill-scanner, nova-net
+pnpm dev:runtime:logs     # Tail nova-openclaw logs
+```
+
+By default, dev helpers use `~/.nova/colima-dev` (`NOVA_COLIMA_HOME`) to isolate
+development runtime state from production/other Colima installs. You can start dev
+without setting it manually:
+
+```bash
+pnpm dev:runtime:up
+```
+
+Override this intentionally if you need a different location:
+
+```bash
+NOVA_COLIMA_HOME=$HOME/.nova/colima-dev-pilot pnpm dev:runtime:up
+```
+
 ### Check Container Logs
 
 ```bash

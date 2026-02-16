@@ -46,6 +46,32 @@ pnpm install
 pnpm tauri dev
 ```
 
+### Dev Runtime Helpers (macOS/Linux)
+
+```bash
+pnpm dev:runtime:start   # Ensure Docker/Colima are ready for Nova runtime
+pnpm dev:runtime:up      # Run start and launch `pnpm tauri:dev`
+pnpm dev:runtime:status  # Check Colima + nova-openclaw state
+pnpm dev:runtime:stop    # Stop nova-openclaw + scanner (not image/volume)
+pnpm dev:runtime:prune   # Remove nova-openclaw / nova-skill-scanner + nova-net
+pnpm dev:runtime:logs    # Tail nova-openclaw logs
+```
+
+Dev mode now uses an isolated Colima home by default:
+`~/.nova/colima-dev`. It does not share that with production/default Colima (`~/.colima`) unless you intentionally override it:
+
+```bash
+pnpm dev:runtime:up
+```
+
+To use a custom dev path intentionally:
+
+```bash
+NOVA_COLIMA_HOME=$HOME/.nova/colima-dev-pilot pnpm dev:runtime:up
+```
+
+For containerized local dev, the app now keeps runtime containers up on app exit; this makes iterative starts faster and avoids full warm-up when restarting the app frequently.
+
 **Isolated dev OAuth (nova-dev://)**
 ```bash
 pnpm tauri:dev

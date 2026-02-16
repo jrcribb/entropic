@@ -58,6 +58,9 @@ pub struct Runtime {
 
 /// Isolated Colima home directory used by Nova to avoid conflicts with
 /// any user-managed global Colima configuration under `~/.colima`.
+#[cfg(debug_assertions)]
+pub(crate) const NOVA_COLIMA_HOME_DIR: &str = ".nova/colima-dev";
+#[cfg(not(debug_assertions))]
 pub(crate) const NOVA_COLIMA_HOME_DIR: &str = ".nova/colima";
 /// Colima profile name used for Apple Virtualization.framework (`vz`) backend.
 pub(crate) const NOVA_VZ_PROFILE: &str = "nova-vz";
@@ -306,8 +309,14 @@ impl Runtime {
             profile,
             output.status.code()
         ));
-        debug_log(&format!("colima status --json stdout ({}): {}", profile, stdout));
-        debug_log(&format!("colima status --json stderr ({}): {}", profile, stderr));
+        debug_log(&format!(
+            "colima status --json stdout ({}): {}",
+            profile, stdout
+        ));
+        debug_log(&format!(
+            "colima status --json stderr ({}): {}",
+            profile, stderr
+        ));
 
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&stdout) {
             if let Some(degraded) = value.get("degraded").and_then(|v| v.as_bool()) {
@@ -357,9 +366,9 @@ impl Runtime {
         self.stop_colima_profile_force(profile);
         std::thread::sleep(std::time::Duration::from_secs(COLIMA_RETRY_DELAY_SECS));
 
-        let restart = self
-            .run_colima_start(profile, "vz")
-            .map_err(|e| RuntimeError::ColimaStartFailed(format!("VZ repair start failed: {}", e)))?;
+        let restart = self.run_colima_start(profile, "vz").map_err(|e| {
+            RuntimeError::ColimaStartFailed(format!("VZ repair start failed: {}", e))
+        })?;
         let restart_stdout = String::from_utf8_lossy(&restart.stdout);
         let restart_stderr = String::from_utf8_lossy(&restart.stderr);
         debug_log(&format!(
@@ -386,7 +395,11 @@ impl Runtime {
 
         match self.run_limactl(&["stop", &instance]) {
             Ok(out) => {
-                debug_log(&format!("limactl stop exit code ({}): {:?}", instance, out.status.code()));
+                debug_log(&format!(
+                    "limactl stop exit code ({}): {:?}",
+                    instance,
+                    out.status.code()
+                ));
                 debug_log(&format!(
                     "limactl stop stderr ({}): {}",
                     instance,
@@ -427,9 +440,9 @@ impl Runtime {
             )));
         }
 
-        let final_start = self
-            .run_colima_start(profile, "vz")
-            .map_err(|e| RuntimeError::ColimaStartFailed(format!("final VZ start failed: {}", e)))?;
+        let final_start = self.run_colima_start(profile, "vz").map_err(|e| {
+            RuntimeError::ColimaStartFailed(format!("final VZ start failed: {}", e))
+        })?;
         debug_log(&format!(
             "final VZ start exit code ({}): {:?}",
             profile,
@@ -492,7 +505,10 @@ impl Runtime {
 
     fn is_docker_ready_on_socket(&self, socket_path: &std::path::Path) -> bool {
         if !socket_path.exists() {
-            debug_log(&format!("Socket missing for readiness check: {:?}", socket_path));
+            debug_log(&format!(
+                "Socket missing for readiness check: {:?}",
+                socket_path
+            ));
             return false;
         }
 
@@ -985,7 +1001,9 @@ impl Runtime {
                                         msg, repair_msg
                                     ));
                                     fell_back_from_vz = true;
-                                    debug_log("Falling back to qemu profile after VZ repair failure");
+                                    debug_log(
+                                        "Falling back to qemu profile after VZ repair failure",
+                                    );
                                     continue;
                                 }
                             }

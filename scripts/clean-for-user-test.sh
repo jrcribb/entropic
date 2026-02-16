@@ -2,6 +2,9 @@
 set -e
 
 echo "🧹 Cleaning up for fresh end-user experience test..."
+
+NOVA_COLIMA_HOME="${NOVA_COLIMA_HOME:-$HOME/.nova/colima-dev}"
+LEGACY_COLIMA_HOME="$HOME/.nova/colima"
 echo ""
 
 # ============================================
@@ -35,9 +38,13 @@ echo "✅ All processes stopped and DMGs unmounted"
 
 echo "🗑️  Cleaning Nova's isolated runtime..."
 
-# Nova uses ~/.nova/colima as isolated home - just delete it
-echo "  → Removing ~/.nova/colima..."
-rm -rf "$HOME/.nova/colima"
+# Nova uses NOVA_COLIMA_HOME as isolated home - just delete it
+echo "  → Removing $NOVA_COLIMA_HOME..."
+rm -rf "$NOVA_COLIMA_HOME"
+
+# Backward-compatible cleanup for legacy paths
+echo "  → Removing legacy $LEGACY_COLIMA_HOME..."
+rm -rf "$LEGACY_COLIMA_HOME"
 
 echo "✅ Nova runtime cleaned"
 
@@ -166,7 +173,8 @@ echo ""
 echo "✅ Complete cleanup done!"
 echo ""
 echo "📊 Current state:"
-echo "  • ~/.nova/colima: $([ -d ~/.nova/colima ] && echo "EXISTS" || echo "REMOVED ✓")"
+echo "  • ${NOVA_COLIMA_HOME}: $([ -d "$NOVA_COLIMA_HOME" ] && echo "EXISTS" || echo "REMOVED ✓")"
+echo "  • ${LEGACY_COLIMA_HOME}: $([ -d "$LEGACY_COLIMA_HOME" ] && echo "EXISTS" || echo "REMOVED ✓")"
 echo "  • ~/.colima: $([ -d ~/.colima ] && echo "EXISTS" || echo "REMOVED ✓")"
 echo "  • src-tauri/target: $([ -d src-tauri/target ] && echo "EXISTS" || echo "REMOVED ✓")"
 echo "  • node_modules: $([ -d node_modules ] && echo "EXISTS" || echo "REMOVED ✓")"

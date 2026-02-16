@@ -452,6 +452,13 @@ export async function apiRequest<T>(
 
   let response: Response;
   try {
+    const requestUrl = `${API_URL}${endpoint}`;
+    authDebug("apiRequest", {
+      method: options.method || "GET",
+      url: requestUrl,
+      hasToken: Boolean(token),
+      bodyLength: options.body ? String(options.body).length : 0,
+    });
     response = await fetch(`${API_URL}${endpoint}`, {
       ...options,
       headers: {
@@ -461,6 +468,10 @@ export async function apiRequest<T>(
       },
     });
   } catch (error: any) {
+    authDebug("apiRequest failed", {
+      message: error?.message || String(error),
+      name: error?.name,
+    });
     throw new ApiRequestError("Network request failed", { kind: "network", data: error });
   }
 

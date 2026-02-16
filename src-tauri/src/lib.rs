@@ -116,7 +116,9 @@ pub fn run() {
                 // Only stop containers on actual app quit (Cmd+Q)
                 #[cfg(target_os = "macos")]
                 {
-                    println!("[Nova] Window close requested — hiding window (containers stay running)");
+                    println!(
+                        "[Nova] Window close requested — hiding window (containers stay running)"
+                    );
                     if let Some(window) = app_handle.get_webview_window(&label) {
                         let _ = window.hide();
                     }
@@ -126,12 +128,12 @@ pub fn run() {
                 // On other platforms, closing window exits the app
                 #[cfg(not(target_os = "macos"))]
                 {
-                    println!("[Nova] Window close requested — stopping containers...");
+                    println!("[Nova] Window close requested — preserving containers...");
                     commands::cleanup_on_exit();
                 }
             }
             RunEvent::Exit => {
-                println!("[Nova] App exiting — stopping containers...");
+                println!("[Nova] App exiting — preserving containers...");
                 commands::cleanup_on_exit();
             }
             _ => {}
