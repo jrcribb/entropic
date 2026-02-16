@@ -835,7 +835,7 @@ impl Default for StoredAgentSettings {
             heartbeat_tasks: Vec::new(),
             memory_enabled: true,
             memory_long_term: false,
-            memory_sessions_enabled: false,
+            memory_sessions_enabled: true,
             capabilities: vec![
                 CapabilityState {
                     id: "web".to_string(),
@@ -1533,6 +1533,12 @@ fn apply_default_qmd_memory_config(
 
         if !qmd.contains_key("includeDefaultMemory") {
             qmd.insert("includeDefaultMemory".to_string(), serde_json::json!(true));
+        }
+        if !qmd.contains_key("command") {
+            qmd.insert(
+                "command".to_string(),
+                serde_json::json!("/data/qmd-wrapper"),
+            );
         }
 
         let sessions = ensure_object_entry(qmd, "sessions");
