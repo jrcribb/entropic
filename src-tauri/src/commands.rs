@@ -1632,6 +1632,9 @@ fn apply_default_qmd_memory_config(
         if qmd.get("command").and_then(|v| v.as_str()) == Some("/data/qmd-wrapper")
             || !qmd.contains_key("command")
         {
+            // `qmd` is now the native OpenClaw-backed command; this avoids
+            // the previous wrapper path, but still requires the qmd runtime deps
+            // from the container image (including the tsx resolver shim).
             qmd.insert("command".to_string(), serde_json::json!("qmd"));
         }
 

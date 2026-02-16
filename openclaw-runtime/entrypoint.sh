@@ -59,6 +59,9 @@ mkdir -p /home/node/.openclaw/workspace
 mkdir -p /home/node/.openclaw/workspace/node_modules
 
 # Ensure qmd's workspace-local tsx resolver stays available even in ESM context.
+# The qmd rewrite changed the command from /data/qmd-wrapper to `qmd`,
+# but the package still uses tsx internally from workspace-relative resolution.
+# Linking only tsx (not full global node_modules) avoids read-only root writes.
 if [ -d /home/node/.bun/install/global/node_modules/tsx ]; then
   ln -sfn /home/node/.bun/install/global/node_modules/tsx /home/node/.openclaw/workspace/node_modules/tsx
 fi
