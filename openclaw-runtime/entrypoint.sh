@@ -56,11 +56,10 @@ ln -sfn /data/qmd-models /home/node/.openclaw/.cache/qmd/models
 
 # Seed workspace directory expected by qmd plugins.
 mkdir -p /home/node/.openclaw/workspace
-ln -sfn /home/node/.bun/install/global/node_modules /home/node/.openclaw/workspace/node_modules
+mkdir -p /home/node/.openclaw/workspace/node_modules
 
 # Ensure qmd's workspace-local tsx resolver stays available even in ESM context.
 if [ -d /home/node/.bun/install/global/node_modules/tsx ]; then
-  mkdir -p /home/node/.openclaw/workspace/node_modules
   ln -sfn /home/node/.bun/install/global/node_modules/tsx /home/node/.openclaw/workspace/node_modules/tsx
 fi
 
