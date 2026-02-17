@@ -903,11 +903,6 @@ const FEATURED_CLAWHUB_SKILLS: &[(&str, &str, &str)] = &[
         "Interact with GitHub repos, issues, PRs, and commits.",
     ),
     (
-        "playwright-mcp",
-        "Playwright MCP",
-        "Full browser automation — navigate, click, fill forms, screenshot.",
-    ),
-    (
         "ontology",
         "Ontology",
         "Knowledge graph and ontology management for structured reasoning.",
@@ -918,24 +913,14 @@ const FEATURED_CLAWHUB_SKILLS: &[(&str, &str, &str)] = &[
         "Intelligent text summarization for long documents and content.",
     ),
     (
-        "tavily-web-search",
+        "arun-8687/tavily-search",
         "Tavily Web Search",
         "Web search powered by Tavily for real-time information retrieval.",
-    ),
-    (
-        "trello",
-        "Trello",
-        "Manage Trello boards, lists, and cards via the Trello REST API.",
     ),
     (
         "slack",
         "Slack",
         "Send and manage Slack messages and channels.",
-    ),
-    (
-        "answer-overflow",
-        "Answer Overflow",
-        "Search and retrieve answers from community knowledge bases.",
     ),
 ];
 
@@ -1163,6 +1148,90 @@ fn container_dir_exists(path: &str) -> Result<bool, String> {
         .success())
 }
 
+fn container_path_exists_checked(path: &str) -> Result<bool, String> {
+    Ok(docker_command()
+        .args(["exec", OPENCLAW_CONTAINER, "test", "-e", "--", path])
+        .output()
+        .map_err(|e| format!("Failed to inspect container path: {}", e))?
+        .status
+        .success())
+}
+
+fn resolve_skill_root_in_container(
+    container: &str,
+    root: &str,
+    expected_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let normalized_root = root.trim_end_matches('/').to_string();
+    if normalized_root.is_empty() {
+        return Ok(None);
+    }
+
+    let direct_skill_md = format!("{}/SKILL.md", normalized_root);
+    let has_direct = docker_command()
+        .args(["exec", container, "test", "-f", "--", &direct_skill_md])
+        .output()
+        .map_err(|e| format!("Failed to inspect skill directory: {}", e))?
+        .status
+        .success();
+    if has_direct {
+        return Ok(Some(normalized_root));
+    }
+
+    let search_cmd = docker_command()
+        .args([
+            "exec",
+            container,
+            "find",
+            &normalized_root,
+            "-name",
+            "SKILL.md",
+            "-type",
+            "f",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to locate skill metadata files: {}", e))?;
+    if !search_cmd.status.success() {
+        return Ok(None);
+    }
+
+    let mut candidates = Vec::<String>::new();
+    for line in String::from_utf8_lossy(&search_cmd.stdout).lines() {
+        let candidate = line.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        if !candidate.starts_with(&normalized_root) {
+            continue;
+        }
+        if !candidate.ends_with("/SKILL.md") {
+            continue;
+        }
+        let parent = candidate.trim_end_matches("/SKILL.md").to_string();
+        if !parent.is_empty() {
+            candidates.push(parent);
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    candidates.sort_by_key(|path| path.matches('/').count());
+    candidates.dedup();
+
+    if let Some(id) = expected_id {
+        if let Some(path) = candidates
+            .iter()
+            .find(|path| path.ends_with(&format!("/{}", id)))
+        {
+            return Ok(Some(path.clone()));
+        }
+    }
+
+    Ok(candidates.into_iter().next())
+}
+
 fn list_container_subdirs(path: &str) -> Result<Vec<String>, String> {
     if !container_dir_exists(path)? {
         return Ok(vec![]);
@@ -1190,7 +1259,12 @@ fn resolve_versioned_skill_dir(skill_id: &str) -> Result<Option<String>, String>
     }
 
     let current = format!("{}/current", skill_root);
-    if container_dir_exists(&current)? {
+    if container_path_exists(&current) {
+        if let Some(path) =
+            resolve_skill_root_in_container(OPENCLAW_CONTAINER, &current, Some(skill_id))?
+        {
+            return Ok(Some(path));
+        }
         return Ok(Some(current));
     }
 
@@ -1200,7 +1274,13 @@ fn resolve_versioned_skill_dir(skill_id: &str) -> Result<Option<String>, String>
     }
     versions.sort();
     let version = versions.pop().unwrap_or_else(|| "latest".to_string());
-    Ok(Some(format!("{}/{}", skill_root, version)))
+    let version_root = format!("{}/{}", skill_root, version);
+    if let Some(path) =
+        resolve_skill_root_in_container(OPENCLAW_CONTAINER, &version_root, Some(skill_id))?
+    {
+        return Ok(Some(path));
+    }
+    Ok(Some(version_root))
 }
 
 fn resolve_installed_skill_dir(skill_id: &str) -> Result<Option<String>, String> {
@@ -1773,8 +1853,6 @@ fn resolve_scannable_skill_root(scanner_root: &str) -> Result<String, String> {
             SCANNER_CONTAINER,
             "find",
             scanner_root,
-            "-maxdepth",
-            "4",
             "-name",
             "SKILL.md",
             "-type",
@@ -2608,6 +2686,10 @@ fn apply_agent_settings(app: &AppHandle, state: &AppState) -> Result<(), String>
         .iter()
         .map(|(id, _)| id.to_string())
         .collect();
+    let installed_workspace_skill_paths: Vec<String> = installed_skill_paths
+        .iter()
+        .map(|(_, path)| path.to_string())
+        .collect();
     let proxy_mode = read_container_env("NOVA_PROXY_MODE").is_some();
     let base_url = read_container_env("NOVA_PROXY_BASE_URL");
     let model = read_container_env("OPENCLAW_MODEL");
@@ -2680,6 +2762,7 @@ Use it for durable decisions, preferences, and facts that should persist across 
         "openai_key_for_lancedb": &openai_key_for_lancedb,
         "thinking_level": &thinking_level_env,
         "installed_workspace_skills": &installed_workspace_skill_ids,
+        "installed_workspace_skill_paths": &installed_workspace_skill_paths,
         "settings": &settings,
         "heartbeat_body": &hb_body,
         "tools_body": &tools_body,
@@ -2880,12 +2963,6 @@ Use it for durable decisions, preferences, and facts that should persist across 
     const NOVA_X_TOOLS: [&str; 4] = ["x_search", "x_profile", "x_thread", "x_user_tweets"];
     const NOVA_CORE_TOOLS: [&str; 1] = ["image"];
 
-    let workspace_plugin_paths: Vec<String> = installed_skill_paths
-        .iter()
-        .filter(|(id, _)| !MANAGED_PLUGIN_IDS.contains(&id.as_str()))
-        .map(|(_, path)| path.to_string())
-        .collect();
-
     let mut workspace_skill_ids: Vec<String> = installed_skill_paths
         .iter()
         .map(|(id, _)| id.to_string())
@@ -2894,12 +2971,33 @@ Use it for durable decisions, preferences, and facts that should persist across 
     workspace_skill_ids.sort();
     workspace_skill_ids.dedup();
 
-    for skill_id in &workspace_skill_ids {
-        set_openclaw_config_value(
-            &mut cfg,
-            &["plugins", "entries", skill_id.as_str(), "enabled"],
-            serde_json::json!(true),
-        );
+    let mut workspace_skill_path_prefixes: Vec<String> = Vec::new();
+    for (skill_id, skill_path) in &installed_skill_paths {
+        if MANAGED_PLUGIN_IDS.contains(&skill_id.as_str()) {
+            continue;
+        }
+        workspace_skill_path_prefixes.push(skill_path.to_string());
+        workspace_skill_path_prefixes.push(format!("{}/{}", SKILLS_ROOT, skill_id));
+        for legacy_root in LEGACY_SKILLS_ROOTS {
+            workspace_skill_path_prefixes.push(format!(
+                "{}/{}",
+                legacy_root.trim_end_matches('/'),
+                skill_id
+            ));
+        }
+    }
+    workspace_skill_path_prefixes.sort();
+    workspace_skill_path_prefixes.dedup();
+
+    // OpenClaw `skills` are SKILL.md prompt assets, not plugin ids. Avoid writing
+    // these ids under plugins.entries to keep config validation clean.
+    if let Some(entries) = cfg
+        .pointer_mut("/plugins/entries")
+        .and_then(|v| v.as_object_mut())
+    {
+        for skill_id in &workspace_skill_ids {
+            entries.remove(skill_id);
+        }
     }
 
     // Enable nova-x plugin if it exists (bundled or mounted).
@@ -2943,21 +3041,21 @@ Use it for durable decisions, preferences, and facts that should persist across 
         }
     }
 
-    let load_paths = cfg
+    if let Some(list) = cfg
         .pointer_mut("/plugins/load/paths")
-        .and_then(|v| v.as_array_mut());
-    if let Some(list) = load_paths {
-        for path in &workspace_plugin_paths {
-            if !list.iter().any(|v| v.as_str() == Some(path.as_str())) {
-                list.push(serde_json::json!(path));
+        .and_then(|v| v.as_array_mut())
+    {
+        list.retain(|path| {
+            let path_value = path.as_str().unwrap_or("");
+            if path_value.is_empty() {
+                return true;
             }
-        }
-    } else if !workspace_plugin_paths.is_empty() {
-        set_openclaw_config_value(
-            &mut cfg,
-            &["plugins", "load", "paths"],
-            serde_json::json!(workspace_plugin_paths),
-        );
+            !workspace_skill_path_prefixes.iter().any(|prefix| {
+                let normalized_prefix = prefix.trim_end_matches('/');
+                path_value == normalized_prefix
+                    || path_value.starts_with(&format!("{}/", normalized_prefix))
+            })
+        });
     }
 
     if let Some(tools) = cfg["tools"].as_object_mut() {
@@ -6520,11 +6618,12 @@ pub async fn remove_workspace_skill(id: String) -> Result<(), String> {
         config_removal_paths.push(path);
     }
 
-    let mut removed_any = false;
-    let mut remove_paths = vec![
-        format!("{}/{}", SKILLS_ROOT, skill_id),
-        format!("{}/{}", SKILL_MANIFESTS_ROOT, skill_id),
-    ];
+    let observed_skill = collect_skill_ids()?.iter().any(|value| value == &skill_id)
+        || container_dir_exists(&format!("{}/{}", SKILL_MANIFESTS_ROOT, skill_id)).unwrap_or(false)
+        || container_path_exists_checked(&format!("{}/{}.json", SKILL_MANIFESTS_ROOT, skill_id))
+            .unwrap_or(false);
+
+    let mut remove_paths = vec![format!("{}/{}", SKILLS_ROOT, skill_id)];
     for legacy_root in LEGACY_SKILLS_ROOTS {
         remove_paths.push(format!(
             "{}/{}",
@@ -6532,29 +6631,34 @@ pub async fn remove_workspace_skill(id: String) -> Result<(), String> {
             skill_id
         ));
     }
+    remove_paths.push(format!("{}/{}", SKILL_MANIFESTS_ROOT, skill_id));
+    remove_paths.push(format!("{}/{}.json", SKILL_MANIFESTS_ROOT, skill_id));
 
+    let mut removed_any = false;
     for full_path in remove_paths {
-        let exists = container_dir_exists(&full_path)?;
-        if !exists {
-            continue;
+        if container_path_exists_checked(&full_path).unwrap_or(false) {
+            removed_any = true;
         }
         docker_exec_output(&["exec", OPENCLAW_CONTAINER, "rm", "-rf", "--", &full_path])?;
-        removed_any = true;
         if !config_removal_paths.contains(&full_path) {
-            config_removal_paths.push(full_path.clone());
+            config_removal_paths.push(full_path);
         }
-    }
-
-    if !removed_any {
-        return Err("Skill not found".to_string());
     }
 
     let mut cfg = read_openclaw_config();
-    remove_openclaw_config_value(&mut cfg, &["plugins", "entries", &skill_id]);
+    let mut config_updated = false;
+    if cfg
+        .pointer(&format!("/plugins/entries/{}", skill_id))
+        .is_some()
+    {
+        remove_openclaw_config_value(&mut cfg, &["plugins", "entries", &skill_id]);
+        config_updated = true;
+    }
     if let Some(load_paths) = cfg
         .pointer_mut("/plugins/load/paths")
         .and_then(|v| v.as_array_mut())
     {
+        let before_len = load_paths.len();
         load_paths.retain(|path| {
             let path_value = path.as_str().unwrap_or("");
             if path_value.is_empty() {
@@ -6567,8 +6671,18 @@ pub async fn remove_workspace_skill(id: String) -> Result<(), String> {
                     || path_value.starts_with(&format!("{}/", normalized_prefix))
             })
         });
+        if load_paths.len() != before_len {
+            config_updated = true;
+        }
     }
-    write_openclaw_config(&cfg)?;
+    if config_updated {
+        write_openclaw_config(&cfg)?;
+    }
+
+    if !observed_skill && !removed_any && !config_updated {
+        return Err("Skill not found".to_string());
+    }
+
     Ok(())
 }
 
@@ -6636,7 +6750,7 @@ pub async fn get_clawhub_catalog(
             .unwrap_or("")
             .trim()
             .to_string();
-        if !is_safe_component(&slug) {
+        if !is_safe_slug(&slug) {
             continue;
         }
         let display_name = item
@@ -6931,6 +7045,8 @@ fn resolve_downloaded_skill_path(temp_root: &str, slug: &str) -> Result<(String,
 
 #[tauri::command]
 pub async fn scan_and_install_clawhub_skill(
+    app: AppHandle,
+    state: State<'_, AppState>,
     slug: String,
     allow_unsafe: bool,
 ) -> Result<ClawhubInstallResult, String> {
@@ -7066,9 +7182,68 @@ pub async fn scan_and_install_clawhub_skill(
         ),
     ]);
 
-    let installed_skill_path = format!("{}/{}/{}", SKILLS_ROOT, detected_skill_id, skill_version);
+    let installed_version_root = format!("{}/{}/{}", SKILLS_ROOT, detected_skill_id, skill_version);
+    let installed_skill_path = match resolve_skill_root_in_container(
+        OPENCLAW_CONTAINER,
+        &installed_version_root,
+        Some(&detected_skill_id),
+    ) {
+        Ok(Some(path)) => path,
+        Ok(None) => installed_version_root.clone(),
+        Err(err) => {
+            eprintln!(
+                "[Nova] Failed to resolve installed skill root for {}: {}",
+                detected_skill_id, err
+            );
+            installed_version_root.clone()
+        }
+    };
     let installed_skill_md =
         read_container_file(&format!("{}/SKILL.md", installed_skill_path)).unwrap_or_default();
+
+    // Mirror the active skill into workspace/skills so OpenClaw's native skills
+    // loader can discover it for chat runs.
+    let workspace_skills_root = format!("{}/skills", WORKSPACE_ROOT);
+    let workspace_skill_path = format!("{}/{}", workspace_skills_root, detected_skill_id);
+    let source_contents = format!("{}/.", installed_skill_path.trim_end_matches('/'));
+    docker_exec_output(&[
+        "exec",
+        OPENCLAW_CONTAINER,
+        "mkdir",
+        "-p",
+        "--",
+        &workspace_skills_root,
+    ])
+    .map_err(|e| format!("Failed to prepare workspace skills directory: {}", e))?;
+    docker_exec_output(&[
+        "exec",
+        OPENCLAW_CONTAINER,
+        "rm",
+        "-rf",
+        "--",
+        &workspace_skill_path,
+    ])
+    .map_err(|e| format!("Failed to remove previous workspace skill copy: {}", e))?;
+    docker_exec_output(&[
+        "exec",
+        OPENCLAW_CONTAINER,
+        "mkdir",
+        "-p",
+        "--",
+        &workspace_skill_path,
+    ])
+    .map_err(|e| format!("Failed to create workspace skill directory: {}", e))?;
+    docker_exec_output(&[
+        "exec",
+        OPENCLAW_CONTAINER,
+        "cp",
+        "-a",
+        "--",
+        &source_contents,
+        &workspace_skill_path,
+    ])
+    .map_err(|e| format!("Failed to sync installed skill into workspace: {}", e))?;
+
     let manifest_path = format!(
         "{}/{}/{}.json",
         SKILL_MANIFESTS_ROOT, detected_skill_id, skill_version
@@ -7103,6 +7278,25 @@ pub async fn scan_and_install_clawhub_skill(
         &serde_json::to_string_pretty(&manifest)
             .map_err(|e| format!("Failed to serialize skill manifest: {}", e))?,
     )?;
+
+    // Hot-register the new skill in the runtime config so the chat agent
+    // can discover it immediately without a full gateway restart.
+    if let Err(e) = apply_agent_settings(&app, &state) {
+        eprintln!(
+            "[Nova] Failed to apply agent settings after skill install: {}",
+            e
+        );
+    }
+    // OpenClaw can cache plugin/tool registry at process start. If the
+    // gateway is running, recreate it so newly installed skills are loaded.
+    if container_running() {
+        if let Err(e) = restart_gateway(app.clone(), state).await {
+            eprintln!(
+                "[Nova] Failed to restart gateway after skill install: {}",
+                e
+            );
+        }
+    }
 
     Ok(ClawhubInstallResult {
         scan,
