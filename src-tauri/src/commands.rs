@@ -1200,6 +1200,12 @@ fn clawhub_latest_version(slug: &str) -> Result<Option<String>, String> {
     Ok(version)
 }
 
+/// Best-effort heuristic that infers scope flags from SKILL.md content for
+/// manifest metadata. Uses substring matching so it can produce false positives
+/// (e.g. docs mentioning URLs) and false negatives (skills that access the
+/// network without documenting it). Not a security gate — downstream consumers
+/// should check the `"heuristic"` field to distinguish authoritative vs.
+/// inferred scopes.
 fn infer_skill_scope_flags(skill_md: &str) -> serde_json::Value {
     let lower = skill_md.to_lowercase();
     let needs_network = lower.contains("http://")
@@ -1213,7 +1219,8 @@ fn infer_skill_scope_flags(skill_md: &str) -> serde_json::Value {
     serde_json::json!({
         "filesystem": true,
         "network": needs_network,
-        "browser": needs_browser
+        "browser": needs_browser,
+        "heuristic": true
     })
 }
 
@@ -4073,6 +4080,109 @@ fn finish_health_wait_or_tolerate_starting(err: String, context: &str) -> Result
     Err(append_colima_runtime_hint(format!("{}: {}", context, err)))
 }
 
+async fn recover_gateway_health(
+    token: &str,
+    docker_args: &[String],
+    label: &str,
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<(), String> {
+    if let Err(initial) = wait_for_gateway_health_strict(token, 12).await {
+        let health_status = container_health_status();
+        if matches!(health_status.as_deref(), Some("starting")) {
+            println!(
+                "[Nova] {} health check failed while health=starting; extending wait: {}",
+                label, initial
+            );
+            if let Err(e) = wait_for_gateway_health_strict(token, 16).await {
+                finish_health_wait_or_tolerate_starting(
+                    e,
+                    &format!("{} failed strict health check after extended wait", label),
+                )?;
+            }
+        } else if matches!(health_status.as_deref(), Some("healthy")) {
+            println!(
+                "[Nova] {} health check failed but container health=healthy; extending wait without restart: {}",
+                label, initial
+            );
+            if let Err(e) = wait_for_gateway_health_strict(token, 16).await {
+                finish_health_wait_or_tolerate_starting(
+                    e,
+                    &format!("{} failed strict health check after extended wait", label),
+                )?;
+            }
+        } else if matches!(health_status.as_deref(), Some("unhealthy")) || !container_running() {
+            println!(
+                "[Nova] {} health check failed with container state {:?}; attempting restart: {}",
+                label, health_status, initial
+            );
+            let restart = docker_command()
+                .args(["restart", OPENCLAW_CONTAINER])
+                .output()
+                .map_err(|e| {
+                    append_colima_runtime_hint(format!("Failed to restart container: {}", e))
+                })?;
+            if !restart.status.success() {
+                let stderr = String::from_utf8_lossy(&restart.stderr);
+                if stderr.contains("is not running") || stderr.contains("no such container") {
+                    println!(
+                        "[Nova] {} container is not running; removing and recreating...",
+                        label
+                    );
+                    let cleanup = docker_command()
+                        .args(["rm", "-f", OPENCLAW_CONTAINER])
+                        .output()
+                        .map_err(|e| format!("Failed to cleanup stale container: {}", e))?;
+                    if !cleanup.status.success() {
+                        println!(
+                            "[Nova] Container cleanup warning after restart failure: {}",
+                            String::from_utf8_lossy(&cleanup.stderr)
+                        );
+                    }
+                    let rerun = docker_command().args(docker_args).output().map_err(|e| {
+                        append_colima_runtime_hint(format!("Failed to rerun container: {}", e))
+                    })?;
+                    if !rerun.status.success() {
+                        let rerun_stderr = String::from_utf8_lossy(&rerun.stderr);
+                        return Err(append_colima_runtime_hint(format!(
+                            "{} failed health check ({}) and recreate failed: {}",
+                            label,
+                            initial,
+                            rerun_stderr.trim()
+                        )));
+                    }
+                } else {
+                    return Err(append_colima_runtime_hint(format!(
+                        "{} failed health check ({}) and restart failed: {}",
+                        label,
+                        initial,
+                        stderr.trim()
+                    )));
+                }
+            }
+            apply_agent_settings(app, state)?;
+            if let Err(e) = wait_for_gateway_health_strict(token, 16).await {
+                finish_health_wait_or_tolerate_starting(
+                    e,
+                    &format!("{} failed strict health check after recovery", label),
+                )?;
+            }
+        } else {
+            println!(
+                "[Nova] {} health check failed with container state {:?}; extending wait without restart: {}",
+                label, health_status, initial
+            );
+            if let Err(e) = wait_for_gateway_health_strict(token, 16).await {
+                finish_health_wait_or_tolerate_starting(
+                    e,
+                    &format!("{} failed strict health check after extended wait", label),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn default_agent_settings() -> StoredAgentSettings {
     StoredAgentSettings::default()
 }
@@ -4575,95 +4685,7 @@ pub async fn start_gateway(app: AppHandle, state: State<'_, AppState>, model: Op
     );
 
     let health_started = Instant::now();
-    if let Err(initial) = wait_for_gateway_health_strict(&gateway_token, 12).await {
-        let health_status = container_health_status();
-        if matches!(health_status.as_deref(), Some("starting")) {
-            println!(
-                "[Nova] Gateway strict health check failed while health=starting; extending wait: {}",
-                initial
-            );
-            if let Err(e) = wait_for_gateway_health_strict(&gateway_token, 16).await {
-                finish_health_wait_or_tolerate_starting(
-                    e,
-                    "Gateway failed strict health check after extended wait",
-                )?;
-            }
-        } else if matches!(health_status.as_deref(), Some("healthy")) {
-            println!(
-                "[Nova] Gateway strict health check failed but container health=healthy; extending wait without restart: {}",
-                initial
-            );
-            if let Err(e) = wait_for_gateway_health_strict(&gateway_token, 16).await {
-                finish_health_wait_or_tolerate_starting(
-                    e,
-                    "Gateway failed strict health check after extended wait",
-                )?;
-            }
-        } else if matches!(health_status.as_deref(), Some("unhealthy")) || !container_running() {
-            println!(
-                "[Nova] Gateway strict health check failed with container state {:?}; attempting restart: {}",
-                health_status, initial
-            );
-            let restart = docker_command()
-                .args(["restart", OPENCLAW_CONTAINER])
-                .output()
-                .map_err(|e| {
-                    append_colima_runtime_hint(format!("Failed to restart container: {}", e))
-                })?;
-            if !restart.status.success() {
-                let stderr = String::from_utf8_lossy(&restart.stderr);
-                if stderr.contains("is not running") || stderr.contains("no such container") {
-                    println!(
-                        "[Nova] Gateway container is not running after startup; removing and recreating..."
-                    );
-                    let cleanup = docker_command()
-                        .args(["rm", "-f", OPENCLAW_CONTAINER])
-                        .output()
-                        .map_err(|e| format!("Failed to cleanup stale container: {}", e))?;
-                    if !cleanup.status.success() {
-                        println!(
-                            "[Nova] Container cleanup warning after restart failure: {}",
-                            String::from_utf8_lossy(&cleanup.stderr)
-                        );
-                    }
-                    let rerun = docker_command().args(&docker_args).output().map_err(|e| {
-                        append_colima_runtime_hint(format!("Failed to rerun container: {}", e))
-                    })?;
-                    if !rerun.status.success() {
-                        let rerun_stderr = String::from_utf8_lossy(&rerun.stderr);
-                        return Err(append_colima_runtime_hint(format!(
-                            "Failed to rerun container: {}",
-                            rerun_stderr
-                        )));
-                    }
-                } else {
-                    return Err(append_colima_runtime_hint(format!(
-                        "Gateway failed health check ({}) and restart failed: {}",
-                        initial,
-                        stderr.trim()
-                    )));
-                }
-            }
-            apply_agent_settings(&app, &state)?;
-            if let Err(e) = wait_for_gateway_health_strict(&gateway_token, 16).await {
-                finish_health_wait_or_tolerate_starting(
-                    e,
-                    "Gateway failed strict health check after recovery",
-                )?;
-            }
-        } else {
-            println!(
-                "[Nova] Gateway strict health check failed with container state {:?}; extending wait without restart: {}",
-                health_status, initial
-            );
-            if let Err(e) = wait_for_gateway_health_strict(&gateway_token, 16).await {
-                finish_health_wait_or_tolerate_starting(
-                    e,
-                    "Gateway failed strict health check after extended wait",
-                )?;
-            }
-        }
-    }
+    recover_gateway_health(&gateway_token, &docker_args, "Gateway", &app, &state).await?;
     // Re-apply settings AFTER health check passes.
     // OpenClaw's initialization may overwrite files we wrote earlier (e.g., auth-profiles.json
     // and config fields like thinkingDefault). Re-applying now ensures our settings stick.
@@ -4674,10 +4696,7 @@ pub async fn start_gateway(app: AppHandle, state: State<'_, AppState>, model: Op
         *cache = None;
     }
     apply_agent_settings(&app, &state)?;
-    println!(
-        "[Nova] Startup timing: post_health_config applied"
-    );
-
+    println!("[Nova] Startup timing: post_health_config applied");
     start_scanner_sidecar_background();
     println!(
         "[Nova] Startup timing: health={}ms total={}ms",
@@ -4860,18 +4879,15 @@ pub async fn start_gateway_with_proxy(
         let model_matches = current_model.as_deref() == Some(model.as_str());
         let image_matches =
             expected_image.is_empty() || current_image.as_deref() == Some(expected_image.as_str());
+        let token_matches = current_token.as_deref() == Some(gateway_token.as_str());
 
         if proxy_matches
             && gateway_token_matches
             && schema_matches
             && model_matches
             && image_matches
+            && token_matches
         {
-            if current_token.as_deref() != Some(gateway_token.as_str()) {
-                println!(
-                    "[Nova] Proxy token changed but container config is otherwise compatible; keeping running container to avoid churn."
-                );
-            }
             println!("[Nova] Proxy container already running with matching config. Reusing.");
             let reuse_prepare_started = Instant::now();
             apply_agent_settings(&app, &state)?;
@@ -4880,107 +4896,8 @@ pub async fn start_gateway_with_proxy(
                 reuse_prepare_started.elapsed().as_millis()
             );
             let health_started = Instant::now();
-            if let Err(initial) = wait_for_gateway_health_strict(&local_gateway_token, 12).await {
-                let health_status = container_health_status();
-                if matches!(health_status.as_deref(), Some("starting")) {
-                    println!(
-                        "[Nova] Proxy health check failed while health=starting; extending wait: {}",
-                        initial
-                    );
-                    if let Err(e) = wait_for_gateway_health_strict(&local_gateway_token, 16).await {
-                        finish_health_wait_or_tolerate_starting(
-                            e,
-                            "Proxy gateway failed strict health check after extended wait",
-                        )?;
-                    }
-                } else if matches!(health_status.as_deref(), Some("healthy")) {
-                    println!(
-                        "[Nova] Proxy health check failed but container health=healthy; extending wait without restart: {}",
-                        initial
-                    );
-                    if let Err(e) = wait_for_gateway_health_strict(&local_gateway_token, 16).await {
-                        finish_health_wait_or_tolerate_starting(
-                            e,
-                            "Proxy gateway failed strict health check after extended wait",
-                        )?;
-                    }
-                } else if matches!(health_status.as_deref(), Some("unhealthy"))
-                    || !container_running()
-                {
-                    println!(
-                        "[Nova] Proxy gateway health check failed with container state {:?}; attempting container restart: {}",
-                        health_status, initial
-                    );
-                    let restart = docker_command()
-                        .args(["restart", OPENCLAW_CONTAINER])
-                        .output()
-                        .map_err(|e| {
-                            append_colima_runtime_hint(format!(
-                                "Failed to restart container: {}",
-                                e
-                            ))
-                        })?;
-                    if !restart.status.success() {
-                        let stderr = String::from_utf8_lossy(&restart.stderr);
-                        if stderr.contains("is not running") || stderr.contains("no such container")
-                        {
-                            println!(
-                                "[Nova] Proxy gateway container is not running after health check; recreating."
-                            );
-                            let (rerun_args, _rerun_env_file) = build_proxy_docker_args()?;
-                            let cleanup = docker_command()
-                                .args(["rm", "-f", OPENCLAW_CONTAINER])
-                                .output()
-                                .map_err(|e| format!("Failed to cleanup stale container: {}", e))?;
-                            if !cleanup.status.success() {
-                                println!(
-                                    "[Nova] Container cleanup warning after restart failure: {}",
-                                    String::from_utf8_lossy(&cleanup.stderr)
-                                );
-                            }
-                            let rerun =
-                                docker_command().args(&rerun_args).output().map_err(|e| {
-                                    append_colima_runtime_hint(format!(
-                                        "Failed to rerun proxy container: {}",
-                                        e
-                                    ))
-                                })?;
-                            if !rerun.status.success() {
-                                let rerun_stderr = String::from_utf8_lossy(&rerun.stderr);
-                                return Err(append_colima_runtime_hint(format!(
-                                    "Proxy gateway failed health check ({}) and recreate failed: {}",
-                                    initial,
-                                    rerun_stderr.trim()
-                                )));
-                            }
-                        } else {
-                            return Err(append_colima_runtime_hint(format!(
-                                "Proxy gateway failed health check ({}) and restart failed: {}",
-                                initial,
-                                stderr.trim()
-                            )));
-                        }
-                    }
-                    apply_agent_settings(&app, &state)?;
-                    if let Err(e) = wait_for_gateway_health_strict(&local_gateway_token, 16).await {
-                        finish_health_wait_or_tolerate_starting(
-                            e,
-                            "Proxy gateway failed strict health check after recovery",
-                        )?;
-                    }
-                } else {
-                    println!(
-                        "[Nova] Proxy health check failed with container state {:?}; extending wait without restart: {}",
-                        health_status, initial
-                    );
-                    if let Err(e) = wait_for_gateway_health_strict(&local_gateway_token, 16).await {
-                        finish_health_wait_or_tolerate_starting(
-                            e,
-                            "Proxy gateway failed strict health check after extended wait",
-                        )?;
-                    }
-                }
-            }
+            let (reuse_docker_args, _reuse_env_file) = build_proxy_docker_args()?;
+            recover_gateway_health(&local_gateway_token, &reuse_docker_args, "Proxy gateway", &app, &state).await?;
             println!(
                 "[Nova] Startup timing (proxy): health={}ms total={}ms",
                 health_started.elapsed().as_millis(),
@@ -4990,6 +4907,9 @@ pub async fn start_gateway_with_proxy(
             return Ok(());
         }
 
+        if !token_matches {
+            println!("[Nova] OPENROUTER_API_KEY changed; tearing down proxy container to apply new credentials.");
+        }
         // Remove running container to ensure proxy config/model updates take effect
         let _ = docker_command()
             .args(["rm", "-f", "nova-openclaw"])
@@ -5093,98 +5013,7 @@ pub async fn start_gateway_with_proxy(
     );
 
     let health_started = Instant::now();
-    if let Err(initial) = wait_for_gateway_health_strict(&local_gateway_token, 12).await {
-        let health_status = container_health_status();
-        if matches!(health_status.as_deref(), Some("starting")) {
-            println!(
-                "[Nova] Proxy strict health check failed while health=starting; extending wait: {}",
-                initial
-            );
-            if let Err(e) = wait_for_gateway_health_strict(&local_gateway_token, 16).await {
-                finish_health_wait_or_tolerate_starting(
-                    e,
-                    "Proxy gateway failed strict health check after extended wait",
-                )?;
-            }
-        } else if matches!(health_status.as_deref(), Some("healthy")) {
-            println!(
-                "[Nova] Proxy strict health check failed but container health=healthy; extending wait without restart: {}",
-                initial
-            );
-            if let Err(e) = wait_for_gateway_health_strict(&local_gateway_token, 16).await {
-                finish_health_wait_or_tolerate_starting(
-                    e,
-                    "Proxy gateway failed strict health check after extended wait",
-                )?;
-            }
-        } else if matches!(health_status.as_deref(), Some("unhealthy")) || !container_running() {
-            println!(
-                "[Nova] Proxy gateway strict health check failed with container state {:?}; attempting restart: {}",
-                health_status, initial
-            );
-            let restart = docker_command()
-                .args(["restart", OPENCLAW_CONTAINER])
-                .output()
-                .map_err(|e| {
-                    append_colima_runtime_hint(format!("Failed to restart container: {}", e))
-                })?;
-            if !restart.status.success() {
-                let stderr = String::from_utf8_lossy(&restart.stderr);
-                if stderr.contains("is not running") || stderr.contains("no such container") {
-                    println!(
-                        "[Nova] Proxy gateway container is not running after startup; removing and recreating..."
-                    );
-                    let cleanup = docker_command()
-                        .args(["rm", "-f", OPENCLAW_CONTAINER])
-                        .output()
-                        .map_err(|e| format!("Failed to cleanup stale container: {}", e))?;
-                    if !cleanup.status.success() {
-                        println!(
-                            "[Nova] Container cleanup warning after restart failure: {}",
-                            String::from_utf8_lossy(&cleanup.stderr)
-                        );
-                    }
-                    let rerun = docker_command().args(&docker_args).output().map_err(|e| {
-                        append_colima_runtime_hint(format!(
-                            "Failed to rerun proxy container: {}",
-                            e
-                        ))
-                    })?;
-                    if !rerun.status.success() {
-                        let rerun_stderr = String::from_utf8_lossy(&rerun.stderr);
-                        return Err(append_colima_runtime_hint(format!(
-                            "Failed to start proxy container after restart failure: {}",
-                            rerun_stderr
-                        )));
-                    }
-                } else {
-                    return Err(append_colima_runtime_hint(format!(
-                        "Proxy gateway failed health check ({}) and restart failed: {}",
-                        initial,
-                        stderr.trim()
-                    )));
-                }
-            }
-            apply_agent_settings(&app, &state)?;
-            if let Err(e) = wait_for_gateway_health_strict(&local_gateway_token, 16).await {
-                finish_health_wait_or_tolerate_starting(
-                    e,
-                    "Proxy gateway failed strict health check after recovery",
-                )?;
-            }
-        } else {
-            println!(
-                "[Nova] Proxy gateway strict health check failed with container state {:?}; extending wait without restart: {}",
-                health_status, initial
-            );
-            if let Err(e) = wait_for_gateway_health_strict(&local_gateway_token, 16).await {
-                finish_health_wait_or_tolerate_starting(
-                    e,
-                    "Proxy gateway failed strict health check after extended wait",
-                )?;
-            }
-        }
-    }
+    recover_gateway_health(&local_gateway_token, &docker_args, "Proxy gateway", &app, &state).await?;
     start_scanner_sidecar_background();
     println!(
         "[Nova] Startup timing (proxy): health={}ms total={}ms",
