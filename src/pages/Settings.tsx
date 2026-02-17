@@ -1,7 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Store } from "@tauri-apps/plugin-store";
-import { Power, Key, Shield, Sparkles, Cpu, Image, ChevronRight, User, Palette } from "lucide-react";
+import { Power, Key, Shield, Sparkles, Cpu, Image, ChevronRight, User, Palette, LogIn, LogOut, Loader2 } from "lucide-react";
 import clsx from "clsx";
 import { loadProfile, saveProfile, type AgentProfile } from "../lib/profile";
 import { useAuth } from "../contexts/AuthContext";
@@ -16,7 +16,7 @@ type Props = {
   selectedModel: string;
   onModelChange: (model: string) => void;
   useLocalKeys: boolean;
-  onUseLocalKeysChange: (value: boolean) => void;
+  onUseLocalKeysChange: (value: boolean) => void | Promise<void>;
   codeModel: string;
   imageModel: string;
   onCodeModelChange: (model: string) => void;
@@ -100,6 +100,16 @@ export function Settings({
   const [memorySessionIndexingError, setMemorySessionIndexingError] = useState<string | null>(null);
   const [soul, setSoul] = useState("");
   
+  // OAuth state
+  const [oauthStatus, setOauthStatus] = useState<Record<string, string>>({});
+  const [oauthLoading, setOauthLoading] = useState<string | null>(null);
+  const [oauthError, setOauthError] = useState<string | null>(null);
+  const [authState, setAuthState] = useState<{ providers: Array<{ id: string; has_key: boolean; last4?: string | null }> }>({ providers: [] });
+  const connectedProviders = authState.providers.filter(p => p.has_key).map(p => p.id);
+  // Anthropic OAuth code-paste state
+  const [anthropicCodePending, setAnthropicCodePending] = useState(false);
+  const [anthropicCodeInput, setAnthropicCodeInput] = useState("");
+
   // Wallpaper state
   const [wallpaperId, setWallpaperId] = useState(DEFAULT_WALLPAPER_ID);
   const [customWallpaper, setCustomWallpaper] = useState<string | null>(null);
@@ -120,6 +130,8 @@ export function Settings({
       const cwp = (await store.get("desktopCustomWallpaper")) as string | null;
       if (cwp) setCustomWallpaper(cwp);
     }).catch(() => {});
+    invoke<Record<string, string>>("get_oauth_status").then(setOauthStatus).catch(() => {});
+    invoke<{ providers: Array<{ id: string; has_key: boolean; last4?: string | null }> }>("get_auth_state").then(setAuthState).catch(() => {});
   }, []);
 
   async function saveWallpaper(id: string, custom?: string | null) {
@@ -159,6 +171,85 @@ export function Settings({
     { label: "Mentor", text: "You are a wise and patient mentor. Guide the user with insightful advice and Socratic questioning." },
     { label: "Coder", text: "You are an expert software engineer. Focus on clean, efficient code and best practices." },
   ];
+
+  async function handleOAuthLogin(provider: "anthropic" | "openai") {
+    setOauthLoading(provider);
+    setOauthError(null);
+    try {
+      if (provider === "anthropic") {
+        // Phase 1: Open browser — user will copy code from Anthropic's page
+        await invoke("start_anthropic_oauth");
+        setAnthropicCodePending(true);
+        setAnthropicCodeInput("");
+        setOauthLoading(null);
+        return; // Don't clear loading state yet — wait for code paste
+      }
+      // OpenAI: single-step localhost callback flow
+      await invoke<{ access_token: string; provider: string }>("start_openai_oauth");
+      const status = await invoke<Record<string, string>>("get_oauth_status");
+      setOauthStatus(status);
+      const state = await invoke<{ providers: Array<{ id: string; has_key: boolean; last4?: string | null }> }>("get_auth_state");
+      setAuthState(state);
+      // OAuth sets a local API key — switch to local keys mode and restart gateway
+      if (!useLocalKeys) {
+        await onUseLocalKeysChange(true);
+        // Small delay to let React state propagate before toggling gateway
+        await new Promise(r => setTimeout(r, 200));
+      }
+      if (!isTogglingGateway) onGatewayToggle();
+      window.dispatchEvent(new Event("nova-auth-changed"));
+    } catch (e) {
+      console.error(`[Nova] OAuth login failed for ${provider}:`, e);
+      setOauthError(typeof e === "string" ? e : `OAuth login failed for ${provider}`);
+    } finally {
+      setOauthLoading(null);
+    }
+  }
+
+  async function handleAnthropicCodeSubmit() {
+    if (!anthropicCodeInput.trim()) return;
+    setOauthLoading("anthropic");
+    setOauthError(null);
+    try {
+      await invoke<{ access_token: string; provider: string }>("complete_anthropic_oauth", {
+        codeState: anthropicCodeInput.trim(),
+      });
+      setAnthropicCodePending(false);
+      setAnthropicCodeInput("");
+      const status = await invoke<Record<string, string>>("get_oauth_status");
+      setOauthStatus(status);
+      const state = await invoke<{ providers: Array<{ id: string; has_key: boolean; last4?: string | null }> }>("get_auth_state");
+      setAuthState(state);
+      // OAuth sets a local API key — switch to local keys mode and restart gateway
+      if (!useLocalKeys) {
+        await onUseLocalKeysChange(true);
+        await new Promise(r => setTimeout(r, 200));
+      }
+      if (!isTogglingGateway) onGatewayToggle();
+      window.dispatchEvent(new Event("nova-auth-changed"));
+    } catch (e) {
+      console.error("[Nova] Anthropic OAuth code exchange failed:", e);
+      setOauthError(typeof e === "string" ? e : "Failed to exchange authorization code");
+    } finally {
+      setOauthLoading(null);
+    }
+  }
+
+  async function handleOAuthDisconnect(provider: "anthropic" | "openai") {
+    try {
+      await invoke("set_api_key", { provider, key: "" });
+      if (provider === "anthropic") {
+        setAnthropicCodePending(false);
+        setAnthropicCodeInput("");
+      }
+      const status = await invoke<Record<string, string>>("get_oauth_status");
+      setOauthStatus(status);
+      const state = await invoke<{ providers: Array<{ id: string; has_key: boolean; last4?: string | null }> }>("get_auth_state");
+      setAuthState(state);
+    } catch (e) {
+      console.error(`[Nova] OAuth disconnect failed for ${provider}:`, e);
+    }
+  }
 
   async function handleMemorySessionIndexingChange(nextEnabled: boolean) {
     setSaving(true);
@@ -355,27 +446,29 @@ export function Settings({
       </SettingsGroup>
 
 
-      {proxyEnabled && (
-        <div className="relative">
-          <SettingsGroup title="Intelligence">
-            <SettingsRow label="Primary Model" icon={Cpu}>
-              <div className="w-80">
-                <ModelSelector selectedModel={selectedModel} onModelChange={onModelChange} />
-              </div>
-            </SettingsRow>
-            <SettingsRow label="Coding Model" icon={Cpu}>
-              <div className="w-80">
-                <ModelSelector selectedModel={codeModel} onModelChange={onCodeModelChange} />
-              </div>
-            </SettingsRow>
-            <SettingsRow label="Vision Model" icon={Image}>
-              <div className="w-80">
-                <ModelSelector selectedModel={imageModel} onModelChange={onImageModelChange} />
-              </div>
-            </SettingsRow>
-          </SettingsGroup>
-        </div>
-      )}
+      <div className="relative">
+        <SettingsGroup title="Intelligence">
+          <SettingsRow label="Primary Model" icon={Cpu}>
+            <div className="w-80">
+              <ModelSelector selectedModel={selectedModel} onModelChange={onModelChange} useLocalKeys={useLocalKeys} connectedProviders={useLocalKeys ? connectedProviders : undefined} />
+            </div>
+          </SettingsRow>
+          {!useLocalKeys && (
+            <>
+              <SettingsRow label="Coding Model" icon={Cpu}>
+                <div className="w-80">
+                  <ModelSelector selectedModel={codeModel} onModelChange={onCodeModelChange} useLocalKeys={useLocalKeys} connectedProviders={useLocalKeys ? connectedProviders : undefined} />
+                </div>
+              </SettingsRow>
+              <SettingsRow label="Vision Model" icon={Image}>
+                <div className="w-80">
+                  <ModelSelector selectedModel={imageModel} onModelChange={onImageModelChange} useLocalKeys={useLocalKeys} connectedProviders={useLocalKeys ? connectedProviders : undefined} />
+                </div>
+              </SettingsRow>
+            </>
+          )}
+        </SettingsGroup>
+      </div>
 
       <SettingsGroup title="Keys">
         <SettingsRow
@@ -406,6 +499,131 @@ export function Settings({
             />
           </button>
         </SettingsRow>
+
+        {useLocalKeys && (
+          <>
+            {/* Anthropic (Claude) OAuth */}
+            {(() => {
+              const isConnected = oauthStatus["anthropic"] === "claude_code";
+              const providerAuth = authState.providers.find(p => p.id === "anthropic");
+              const hasKey = providerAuth?.has_key ?? false;
+              const last4 = providerAuth?.last4;
+              const isLoading = oauthLoading === "anthropic";
+
+              return (
+                <>
+                  <SettingsRow
+                    label="Claude (OAuth)"
+                    icon={LogIn}
+                    description={
+                      isConnected && last4
+                        ? `Connected (...${last4})`
+                        : anthropicCodePending
+                          ? "Paste the code from your browser"
+                          : hasKey
+                            ? `API key set (...${last4 || "****"})`
+                            : "Sign in with your Claude Code account"
+                    }
+                  >
+                    {isLoading ? (
+                      <Loader2 className="w-4 h-4 animate-spin text-[var(--text-tertiary)]" />
+                    ) : isConnected ? (
+                      <button
+                        onClick={() => handleOAuthDisconnect("anthropic")}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg text-red-600 hover:bg-red-50 transition-colors"
+                      >
+                        <LogOut className="w-3.5 h-3.5" />
+                        Disconnect
+                      </button>
+                    ) : anthropicCodePending ? (
+                      <button
+                        onClick={() => { setAnthropicCodePending(false); setAnthropicCodeInput(""); }}
+                        className="text-xs text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => handleOAuthLogin("anthropic")}
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-[var(--system-blue)] text-white hover:bg-[var(--system-blue)]/90 transition-colors"
+                      >
+                        <LogIn className="w-3.5 h-3.5" />
+                        Sign in
+                      </button>
+                    )}
+                  </SettingsRow>
+                  {anthropicCodePending && (
+                    <div className="px-4 pb-3 flex gap-2">
+                      <input
+                        type="text"
+                        value={anthropicCodeInput}
+                        onChange={(e) => setAnthropicCodeInput(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") handleAnthropicCodeSubmit(); }}
+                        placeholder="Paste code here..."
+                        className="flex-1 px-3 py-1.5 text-xs rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] focus:outline-none focus:ring-1 focus:ring-[var(--system-blue)]"
+                        autoFocus
+                      />
+                      <button
+                        onClick={handleAnthropicCodeSubmit}
+                        disabled={!anthropicCodeInput.trim()}
+                        className="px-3 py-1.5 text-xs font-medium rounded-lg bg-[var(--system-blue)] text-white hover:bg-[var(--system-blue)]/90 disabled:opacity-40 transition-colors"
+                      >
+                        Connect
+                      </button>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
+
+            {/* OpenAI OAuth */}
+            {(() => {
+              const isConnected = oauthStatus["openai"] === "openai_codex";
+              const providerAuth = authState.providers.find(p => p.id === "openai");
+              const hasKey = providerAuth?.has_key ?? false;
+              const last4 = providerAuth?.last4;
+              const isLoading = oauthLoading === "openai";
+
+              return (
+                <SettingsRow
+                  label="OpenAI (OAuth)"
+                  icon={LogIn}
+                  description={
+                    isConnected && last4
+                      ? `Connected (...${last4})`
+                      : hasKey
+                        ? `API key set (...${last4 || "****"})`
+                        : "Sign in with your OpenAI / Codex account"
+                  }
+                >
+                  {isLoading ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-[var(--text-tertiary)]" />
+                  ) : isConnected ? (
+                    <button
+                      onClick={() => handleOAuthDisconnect("openai")}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg text-red-600 hover:bg-red-50 transition-colors"
+                    >
+                      <LogOut className="w-3.5 h-3.5" />
+                      Disconnect
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => handleOAuthLogin("openai")}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-[var(--system-blue)] text-white hover:bg-[var(--system-blue)]/90 transition-colors"
+                    >
+                      <LogIn className="w-3.5 h-3.5" />
+                      Sign in
+                    </button>
+                  )}
+                </SettingsRow>
+              );
+            })()}
+
+            {oauthError && (
+              <div className="px-4 pb-3 pt-1 text-xs text-red-600">{oauthError}</div>
+            )}
+          </>
+        )}
       </SettingsGroup>
 
       {/* Wallpaper Picker Modal */}

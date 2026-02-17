@@ -21,6 +21,7 @@ import {
   stopIntegrationRefreshLoop,
 } from "../lib/integrations";
 import { getGatewayStatusCached } from "../lib/gateway-status";
+import { LOCAL_MODEL_IDS, PROXY_MODEL_IDS } from "../components/ModelSelector";
 import { Store as TauriStore } from "@tauri-apps/plugin-store";
 
 type RuntimeStatus = {
@@ -35,8 +36,9 @@ type Props = {
   onRefresh: () => void;
 };
 
-// Default model for proxy mode
-const DEFAULT_MODEL = "openai/gpt-5.2";
+// Default models per mode
+const DEFAULT_PROXY_MODEL = "openai/gpt-5.2";
+const DEFAULT_LOCAL_MODEL = "anthropic/claude-opus-4-6:thinking";
 
 export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
   const { isAuthenticated, isAuthConfigured } = useAuth();
@@ -53,7 +55,8 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
   const [gatewayRetryIn, setGatewayRetryIn] = useState<number | null>(null);
   const [integrationsSyncing, setIntegrationsSyncing] = useState(false);
   const [integrationsMissing, setIntegrationsMissing] = useState(false);
-  const [selectedModel, setSelectedModel] = useState(DEFAULT_MODEL);
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
+  const [selectedModel, setSelectedModel] = useState(DEFAULT_PROXY_MODEL);
   const [codeModel, setCodeModel] = useState("openai/gpt-5.2-codex");
   const [imageModel, setImageModel] = useState("google/gemini-3-pro-image-preview");
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
@@ -68,22 +71,43 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
   const retryTimeoutRef = useRef<number | null>(null);
   const retryIntervalRef = useRef<number | null>(null);
   const fullSyncRef = useRef(false);
+  const [providerSwitchConfirm, setProviderSwitchConfirm] = useState<{
+    oldProvider: string;
+    newProvider: string;
+    newModel: string;
+  } | null>(null);
 
   // Load saved model preference
   useEffect(() => {
     async function loadModel() {
       try {
         const store = await TauriStore.load("nova-settings.json");
-        const saved = await store.get("selectedModel") as string | null;
-        if (saved) setSelectedModel(saved);
         const storedUseLocal = await store.get("useLocalKeys") as boolean | null;
         if (typeof storedUseLocal === "boolean") setUseLocalKeys(storedUseLocal);
+        const isLocal = storedUseLocal === true;
+
+        const saved = await store.get("selectedModel") as string | null;
+        if (saved) {
+          // If the saved model doesn't match the current mode, pick a sensible default
+          if (isLocal && !LOCAL_MODEL_IDS.has(saved)) {
+            setSelectedModel(DEFAULT_LOCAL_MODEL);
+          } else if (!isLocal && !PROXY_MODEL_IDS.has(saved)) {
+            setSelectedModel(DEFAULT_PROXY_MODEL);
+          } else {
+            setSelectedModel(saved);
+          }
+        } else {
+          setSelectedModel(isLocal ? DEFAULT_LOCAL_MODEL : DEFAULT_PROXY_MODEL);
+        }
+
         const savedCode = await store.get("codeModel") as string | null;
         if (savedCode) setCodeModel(savedCode);
         const savedImage = await store.get("imageModel") as string | null;
         if (savedImage) setImageModel(savedImage);
       } catch (error) {
         console.error("[Nova] Failed to load model preference:", error);
+      } finally {
+        setPrefsLoaded(true);
       }
     }
     loadModel();
@@ -420,6 +444,8 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
 
   // Auto-start gateway for authenticated users
   useEffect(() => {
+    if (!prefsLoaded) return; // Wait for stored preferences before deciding proxy vs local
+
     async function autoStartGateway() {
       const proxyEnabled = isAuthConfigured && isAuthenticated && !useLocalKeys;
       console.log("[Nova] Auto-start check:", {
@@ -427,25 +453,28 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
         isAuthenticated,
         useLocalKeys,
         proxyEnabled,
+        prefsLoaded,
         gatewayRunning,
         isTogglingGateway,
         gatewayRetryIn,
         autoStartAttempted: autoStartAttemptedRef.current
       });
 
-      // Only attempt auto-start once, when authenticated via OAuth
-      if (
-        !autoStartAttemptedRef.current &&
-        proxyEnabled &&
-        !gatewayRunning &&
-        !isTogglingGateway &&
-        gatewayRetryIn === null
-      ) {
-        const alreadyRunning = await getGatewayStatusCached({ force: true });
-        if (alreadyRunning) {
+      if (autoStartAttemptedRef.current || gatewayRunning || isTogglingGateway || gatewayRetryIn !== null) {
+        return;
+      }
+
+      // Check if gateway is already running
+      const alreadyRunning = await getGatewayStatusCached({ force: true });
+      console.log("[Nova] Auto-start: alreadyRunning =", alreadyRunning, "proxyEnabled =", proxyEnabled, "useLocalKeys =", useLocalKeys);
+
+      if (alreadyRunning) {
+        autoStartAttemptedRef.current = true;
+
+        if (proxyEnabled) {
+          // Proxy mode — refresh token/config so stale gateway tokens don't persist across app launches.
+          console.log("[Nova] Auto-start: existing container found, refreshing proxy config...");
           setGatewayRunning(true);
-          autoStartAttemptedRef.current = true;
-          // Proactively refresh proxy token/config so stale gateway tokens don't persist across app launches.
           setIsTogglingGateway(true);
           try {
             await startGatewayProxyFlow({
@@ -459,11 +488,37 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
           } finally {
             setIsTogglingGateway(false);
           }
-          return;
+        } else if (useLocalKeys) {
+          // Local-keys mode but a (likely stale proxy) container is running — stop and restart with correct config.
+          console.log("[Nova] Auto-start: existing container found but we're in local-keys mode — restarting with local keys...");
+          setShowGatewayStartup(true);
+          setGatewayStartupStage("launch");
+          setIsTogglingGateway(true);
+          try {
+            await invoke("stop_gateway");
+            console.log("[Nova] Auto-start: stopped stale container, starting with local keys...");
+            await invoke("start_gateway", { model: selectedModel });
+            setGatewayStartupStage("health");
+            await new Promise((r) => setTimeout(r, 2000));
+            await checkGateway();
+            console.log("[Nova] Auto-start: local-keys restart completed");
+          } catch (error) {
+            console.error("[Nova] Auto-start: local-keys restart failed:", error);
+          } finally {
+            setIsTogglingGateway(false);
+            setShowGatewayStartup(false);
+          }
+        } else {
+          setGatewayRunning(true);
         }
-        autoStartAttemptedRef.current = true;
-        console.log("[Nova] Auto-starting gateway for authenticated user...");
+        return;
+      }
 
+      autoStartAttemptedRef.current = true;
+
+      if (proxyEnabled) {
+        // Auto-start in proxy mode
+        console.log("[Nova] Auto-starting gateway in proxy mode...");
         setIsTogglingGateway(true);
         try {
           const result = await startGatewayProxyFlow({
@@ -472,17 +527,35 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
             stopFirst: false,
             allowRetry: true,
           });
-          console.log("[Nova] Auto-start result:", result);
+          console.log("[Nova] Auto-start proxy result:", result);
         } catch (error) {
-          console.error("[Nova] Auto-start error:", error);
+          console.error("[Nova] Auto-start proxy error:", error);
         } finally {
           setIsTogglingGateway(false);
+        }
+      } else if (useLocalKeys) {
+        // Auto-start in local-keys mode
+        console.log("[Nova] Auto-starting gateway in local-keys mode (no existing container)...");
+        setShowGatewayStartup(true);
+        setGatewayStartupStage("launch");
+        setIsTogglingGateway(true);
+        try {
+          await invoke("start_gateway", { model: selectedModel });
+          setGatewayStartupStage("health");
+          await new Promise((r) => setTimeout(r, 2000));
+          await checkGateway();
+          console.log("[Nova] Auto-start (local keys) completed");
+        } catch (error) {
+          console.error("[Nova] Auto-start (local keys) error:", error);
+        } finally {
+          setIsTogglingGateway(false);
+          setShowGatewayStartup(false);
         }
       }
     }
 
     autoStartGateway();
-  }, [isAuthenticated, isAuthConfigured, gatewayRunning, isTogglingGateway, selectedModel, gatewayRetryIn, imageModel]);
+  }, [prefsLoaded, isAuthenticated, isAuthConfigured, useLocalKeys, gatewayRunning, isTogglingGateway, selectedModel, gatewayRetryIn, imageModel]);
 
   async function checkGateway(): Promise<boolean> {
     try {
@@ -527,7 +600,7 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
           }
         } else {
           // Not authenticated, use direct API keys
-          await invoke("start_gateway");
+          await invoke("start_gateway", { model: selectedModel });
         }
 
         console.log("[Nova] Gateway started successfully");
@@ -575,7 +648,22 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
   }
 
   // Handle model change - restart gateway with new model
-  async function handleModelChange(newModel: string) {
+  function handleModelChange(newModel: string) {
+    // In local-keys mode, warn if switching providers (container restart interrupts running tasks)
+    if (useLocalKeys && gatewayRunning) {
+      const oldProvider = selectedModel.split("/")[0];
+      const newProvider = newModel.split("/")[0];
+      if (oldProvider !== newProvider) {
+        setProviderSwitchConfirm({ oldProvider, newProvider, newModel });
+        return;
+      }
+    }
+    executeModelChange(newModel);
+  }
+
+  // Handle confirmed provider switch (called from confirmation modal)
+  async function executeModelChange(newModel: string) {
+    setProviderSwitchConfirm(null);
     setSelectedModel(newModel);
 
     // Save preference
@@ -587,8 +675,10 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
       console.error("[Nova] Failed to save model preference:", error);
     }
 
-    // If gateway is running and we're in proxy mode, restart with new model
-    if (gatewayRunning && isAuthConfigured && isAuthenticated && !useLocalKeys && gatewayTokenRef.current) {
+    if (!gatewayRunning) return;
+
+    if (isAuthConfigured && isAuthenticated && !useLocalKeys && gatewayTokenRef.current) {
+      // Proxy mode — restart with new model via proxy flow
       setIsTogglingGateway(true);
       try {
         await startGatewayProxyFlow({
@@ -601,6 +691,35 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
         console.error("[Nova] Failed to restart gateway with new model:", error);
       } finally {
         setIsTogglingGateway(false);
+      }
+    } else if (useLocalKeys) {
+      const oldProvider = selectedModel.split("/")[0];
+      const newProvider = newModel.split("/")[0];
+      if (oldProvider !== newProvider) {
+        // Provider switch — full container restart needed (different API keys/env vars)
+        console.log("[Nova] Provider switch in local-keys mode, restarting gateway with:", newModel);
+        setShowGatewayStartup(true);
+        setGatewayStartupStage("launch");
+        setIsTogglingGateway(true);
+        try {
+          await invoke("restart_gateway", { model: newModel });
+          setGatewayStartupStage("health");
+          await new Promise((r) => setTimeout(r, 2000));
+          await checkGateway();
+        } catch (error) {
+          console.error("[Nova] Failed to restart gateway with new model:", error);
+        } finally {
+          setIsTogglingGateway(false);
+          setShowGatewayStartup(false);
+        }
+      } else {
+        // Same provider — hot-swap model in config (no container restart)
+        console.log("[Nova] Same-provider model change, hot-swapping to:", newModel);
+        try {
+          await invoke("update_gateway_model", { model: newModel });
+        } catch (error) {
+          console.error("[Nova] Failed to hot-swap model:", error);
+        }
       }
     }
   }
@@ -620,6 +739,7 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
             onRecoverProxyAuth={recoverProxyAuthFromChat}
             useLocalKeys={useLocalKeys}
             selectedModel={selectedModel}
+            onModelChange={handleModelChange}
             imageModel={imageModel}
             integrationsSyncing={integrationsSyncing}
             integrationsMissing={integrationsMissing}
@@ -696,22 +816,39 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
             useLocalKeys={useLocalKeys}
             onUseLocalKeysChange={async (value) => {
               setUseLocalKeys(value);
+
+              // Reset model if current selection doesn't exist in the target mode
+              const validIds = value ? LOCAL_MODEL_IDS : PROXY_MODEL_IDS;
+              const newModel = validIds.has(selectedModel)
+                ? selectedModel
+                : value ? DEFAULT_LOCAL_MODEL : DEFAULT_PROXY_MODEL;
+              if (newModel !== selectedModel) {
+                setSelectedModel(newModel);
+              }
+
               try {
                 const store = await TauriStore.load("nova-settings.json");
                 await store.set("useLocalKeys", value);
+                await store.set("selectedModel", newModel);
                 await store.save();
               } catch (error) {
                 console.error("[Nova] Failed to save useLocalKeys:", error);
               }
 
+              // Stop existing container — the auto-start effect will restart
+              // in the correct mode once React commits the state update.
+              // We can't call startGatewayProxyFlow directly because it reads
+              // useLocalKeys from the closure (still the old value).
               if (gatewayRunning) {
                 try {
                   await invoke("stop_gateway");
                 } catch (error) {
                   console.error("[Nova] Failed to stop gateway:", error);
                 }
-                await checkGateway();
+                setGatewayRunning(false);
               }
+              // Reset auto-start guard so the effect fires again
+              autoStartAttemptedRef.current = false;
             }}
             codeModel={codeModel}
             imageModel={imageModel}
@@ -775,6 +912,30 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
         setCurrentPage("chat");
       }}
     >
+      {providerSwitchConfirm && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center">
+          <div className="w-full max-w-sm mx-4 rounded-2xl bg-white border border-[var(--border-subtle)] shadow-xl p-6">
+            <h2 className="text-sm font-semibold text-[var(--text-primary)]">Switch provider?</h2>
+            <p className="text-xs text-[var(--text-secondary)] mt-2">
+              Switching from <strong>{providerSwitchConfirm.oldProvider}</strong> to <strong>{providerSwitchConfirm.newProvider}</strong> will restart the sandbox container. Any running tasks will be interrupted.
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                className="rounded-full border border-[var(--border-subtle)] bg-white px-4 py-1.5 text-xs text-[var(--text-primary)] hover:bg-[var(--bg-muted)]"
+                onClick={() => setProviderSwitchConfirm(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="rounded-full bg-[var(--text-primary)] px-4 py-1.5 text-xs text-white hover:opacity-90"
+                onClick={() => executeModelChange(providerSwitchConfirm.newModel)}
+              >
+                Switch Provider
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {showGatewayStartup && (
         <div className="absolute inset-0 z-50 flex items-center justify-center">
           <div className="w-full max-w-sm mx-4 rounded-2xl bg-white border border-[var(--border-subtle)] shadow-xl p-6">

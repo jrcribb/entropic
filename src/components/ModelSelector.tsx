@@ -2,14 +2,56 @@ import { useState, useEffect, useRef, type CSSProperties } from "react";
 import { ChevronDown, Zap, Star, Brain, Sparkles } from "lucide-react";
 import { Model } from "../lib/auth";
 
-// Fallback models if API fails
-const FALLBACK_MODELS: Model[] = [
+// Proxy-mode models (routed through Nova backend)
+const PROXY_MODELS: Model[] = [
   { id: "openrouter/free", name: "OpenRouter Free (Router)", provider: "OpenRouter", tier: "fast" },
   { id: "anthropic/claude-opus-4.5", name: "Claude Opus 4.5", provider: "Anthropic", tier: "premium" },
   { id: "openai/gpt-5.2", name: "GPT‑5.2", provider: "OpenAI", tier: "recommended" },
   { id: "openai/gpt-5.2-codex", name: "GPT‑5.2 Codex", provider: "OpenAI", tier: "reasoning" },
   { id: "google/gemini-3-pro-image-preview", name: "Gemini 3 Pro Image (Nano Banana 3)", provider: "Google", tier: "premium" },
 ];
+
+// Local-keys models (direct provider API access)
+const LOCAL_MODELS: Model[] = [
+  // Anthropic — thinking-enabled variants first
+  { id: "anthropic/claude-opus-4-6:thinking", name: "Claude Opus 4.6 (Thinking)", provider: "Anthropic", tier: "premium" },
+  { id: "anthropic/claude-opus-4-6", name: "Claude Opus 4.6", provider: "Anthropic", tier: "premium" },
+  { id: "anthropic/claude-opus-4-5:thinking", name: "Claude Opus 4.5 (Thinking)", provider: "Anthropic", tier: "premium" },
+  { id: "anthropic/claude-opus-4-5", name: "Claude Opus 4.5", provider: "Anthropic", tier: "premium" },
+  { id: "anthropic/claude-sonnet-4-5-20250929:thinking", name: "Claude Sonnet 4.5 (Thinking)", provider: "Anthropic", tier: "recommended" },
+  { id: "anthropic/claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5", provider: "Anthropic", tier: "recommended" },
+  { id: "anthropic/claude-sonnet-4-20250514:thinking", name: "Claude Sonnet 4 (Thinking)", provider: "Anthropic", tier: "recommended" },
+  { id: "anthropic/claude-sonnet-4-20250514", name: "Claude Sonnet 4", provider: "Anthropic", tier: "recommended" },
+  { id: "anthropic/claude-haiku-3-5-20241022", name: "Claude Haiku 3.5", provider: "Anthropic", tier: "fast" },
+  // OpenAI Codex — uses openai-codex/ provider prefix for OAuth auth-profiles
+  { id: "openai-codex/gpt-5.3-codex:reasoning=xhigh", name: "GPT-5.3 Codex (Extra High)", provider: "OpenAI", tier: "premium" },
+  { id: "openai-codex/gpt-5.3-codex:reasoning=high", name: "GPT-5.3 Codex (High)", provider: "OpenAI", tier: "premium" },
+  { id: "openai-codex/gpt-5.3-codex:reasoning=medium", name: "GPT-5.3 Codex (Medium)", provider: "OpenAI", tier: "premium" },
+  { id: "openai-codex/gpt-5.3-codex:reasoning=low", name: "GPT-5.3 Codex (Low)", provider: "OpenAI", tier: "premium" },
+  { id: "openai-codex/gpt-5.2:reasoning=xhigh", name: "GPT-5.2 (Extra High)", provider: "OpenAI", tier: "recommended" },
+  { id: "openai-codex/gpt-5.2:reasoning=high", name: "GPT-5.2 (High)", provider: "OpenAI", tier: "recommended" },
+  { id: "openai-codex/gpt-5.2:reasoning=medium", name: "GPT-5.2 (Medium)", provider: "OpenAI", tier: "recommended" },
+  { id: "openai-codex/gpt-5.2:reasoning=low", name: "GPT-5.2 (Low)", provider: "OpenAI", tier: "recommended" },
+  { id: "openai-codex/gpt-5.2-codex:reasoning=xhigh", name: "GPT-5.2 Codex (Extra High)", provider: "OpenAI", tier: "reasoning" },
+  { id: "openai-codex/gpt-5.2-codex:reasoning=high", name: "GPT-5.2 Codex (High)", provider: "OpenAI", tier: "reasoning" },
+  { id: "openai-codex/gpt-5.2-codex:reasoning=medium", name: "GPT-5.2 Codex (Medium)", provider: "OpenAI", tier: "reasoning" },
+  { id: "openai-codex/gpt-5.2-codex:reasoning=low", name: "GPT-5.2 Codex (Low)", provider: "OpenAI", tier: "reasoning" },
+  // Google
+  { id: "google/gemini-2.5-pro", name: "Gemini 2.5 Pro", provider: "Google", tier: "premium" },
+  { id: "google/gemini-2.0-flash", name: "Gemini 2.0 Flash", provider: "Google", tier: "fast" },
+];
+
+// Exported ID sets for mode-mismatch detection in Dashboard
+export const PROXY_MODEL_IDS = new Set(PROXY_MODELS.map(m => m.id));
+export const LOCAL_MODEL_IDS = new Set(LOCAL_MODELS.map(m => m.id));
+
+// Map provider display names to auth provider IDs
+const PROVIDER_AUTH_ID: Record<string, string> = {
+  Anthropic: "anthropic",
+  OpenAI: "openai",
+  Google: "google",
+  OpenRouter: "openrouter",
+};
 
 const TIER_ICONS: Record<string, typeof Zap> = {
   fast: Zap,
@@ -39,18 +81,20 @@ interface ModelSelectorProps {
   selectedModel: string;
   onModelChange: (modelId: string) => void;
   compact?: boolean;
+  useLocalKeys?: boolean;
+  /** Provider IDs that have keys configured (e.g. ["anthropic", "openai"]). When set, only matching providers are shown. */
+  connectedProviders?: string[];
 }
 
-export function ModelSelector({ selectedModel, onModelChange, compact = false }: ModelSelectorProps) {
-  const [models, _setModels] = useState<Model[]>(FALLBACK_MODELS);
+export function ModelSelector({ selectedModel, onModelChange, compact = false, useLocalKeys = false, connectedProviders }: ModelSelectorProps) {
+  const allModels = useLocalKeys ? LOCAL_MODELS : PROXY_MODELS;
+  // Filter to only show models from providers the user has connected
+  const models = connectedProviders && connectedProviders.length > 0
+    ? allModels.filter(m => connectedProviders.includes(PROVIDER_AUTH_ID[m.provider] ?? m.provider.toLowerCase()))
+    : allModels;
   const [isOpen, setIsOpen] = useState(false);
-  const [_isLoading, setIsLoading] = useState(true);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const [menuStyle, setMenuStyle] = useState<CSSProperties | null>(null);
-
-  useEffect(() => {
-    setIsLoading(false);
-  }, []);
 
   // Save model preference
   const handleModelChange = async (modelId: string) => {

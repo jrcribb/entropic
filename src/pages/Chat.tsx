@@ -8,6 +8,7 @@ import { loadOnboardingData, type OnboardingData } from "../lib/profile";
 import { SuggestionChip, type SuggestionAction } from "../components/SuggestionChip";
 import { ChannelSetupModal } from "../components/ChannelSetupModal";
 import { MarkdownContent } from "../components/MarkdownContent";
+import { ModelSelector } from "../components/ModelSelector";
 import { useAuth } from "../contexts/AuthContext";
 import { syncAllIntegrationsToGateway, getCachedIntegrationProviders, getIntegrations } from "../lib/integrations";
 import { resolveGatewayAuth } from "../lib/gateway-auth";
@@ -785,6 +786,7 @@ export function Chat({
   onRecoverProxyAuth,
   useLocalKeys,
   selectedModel,
+  onModelChange,
   imageModel: _imageModel,
   integrationsSyncing,
   integrationsMissing,
@@ -800,6 +802,7 @@ export function Chat({
   onRecoverProxyAuth?: () => Promise<boolean> | boolean;
   useLocalKeys: boolean;
   selectedModel: string;
+  onModelChange?: (model: string) => void;
   imageModel: string;
   integrationsSyncing?: boolean;
   integrationsMissing?: boolean;
@@ -823,7 +826,11 @@ export function Chat({
   const [selectedProvider, setSelectedProvider] = useState<Provider | null>(null);
   const [keyInput, setKeyInput] = useState("");
   const [connectedProvider, setConnectedProvider] = useState<string | null>(null);
-  const [_providerStatus, setProviderStatus] = useState<AuthState["providers"]>([]);
+  const [oauthLoading, setOauthLoading] = useState<string | null>(null);
+  const [anthropicCodePending, setAnthropicCodePending] = useState(false);
+  const [anthropicCodeInput, setAnthropicCodeInput] = useState("");
+  const [providerStatus, setProviderStatus] = useState<AuthState["providers"]>([]);
+  const connectedProviders = providerStatus.filter(p => p.has_key).map(p => p.id);
   const [gatewayUrl, setGatewayUrl] = useState(DEFAULT_GATEWAY_URL);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [dragActive, setDragActive] = useState(false);
@@ -1207,12 +1214,16 @@ export function Chat({
     loadOnboardingData().then(setOnboardingData).catch(console.error);
   }, []);
 
-  // Simplified effect for loading initial state
-  useEffect(() => {
+  // Load initial auth state + refresh on auth changes (e.g. OAuth in Settings)
+  const refreshAuthState = () => {
     invoke<AuthState>("get_auth_state").then(state => {
       setProviderStatus(state.providers);
       setConnectedProvider(state.active_provider || state.providers.find(p => p.has_key)?.id || null);
     }).catch(console.error);
+  };
+
+  useEffect(() => {
+    refreshAuthState();
     resolveGatewayAuth()
       .then(({ wsUrl }) => {
         if (wsUrl) setGatewayUrl(wsUrl);
@@ -1220,6 +1231,10 @@ export function Chat({
       .catch(() => {
         invoke<string>("get_gateway_ws_url").then(url => url && setGatewayUrl(url)).catch(console.error);
       });
+
+    const onAuthChanged = () => refreshAuthState();
+    window.addEventListener("nova-auth-changed", onAuthChanged);
+    return () => window.removeEventListener("nova-auth-changed", onAuthChanged);
   }, []);
 
   // If authenticated via proxy, treat as connected even without local API keys
@@ -2151,8 +2166,90 @@ export function Chat({
         <div className="glass-card p-8 max-w-md">
           <Sparkles className="w-10 h-10 mx-auto mb-4 text-[var(--text-accent)]" />
           <h2 className="text-xl font-semibold mb-2 text-[var(--text-primary)]">Connect an AI Service</h2>
-          <p className="mb-6 text-[var(--text-secondary)]">Add an API key to start chatting with your assistant.</p>
-          <div className="space-y-3">
+          <p className="mb-6 text-[var(--text-secondary)]">Sign in with your account or add an API key.</p>
+
+          {/* OAuth sign-in buttons */}
+          <div className="space-y-2 mb-4">
+            {/* Anthropic */}
+            {anthropicCodePending ? (
+              <div className="p-3 rounded-lg bg-black/[0.03]">
+                <p className="text-sm font-medium text-[var(--text-primary)] mb-1">Paste the code from your browser</p>
+                <p className="text-xs text-[var(--text-tertiary)] mb-3">After authorizing in your browser, copy the code and paste it below.</p>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={anthropicCodeInput}
+                    onChange={(e) => setAnthropicCodeInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") submitAnthropicCode(); }}
+                    placeholder="Paste code here..."
+                    className="flex-1 px-3 py-2 text-sm rounded-lg border border-black/10 bg-white text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] focus:outline-none focus:ring-1 focus:ring-[var(--purple-accent)]"
+                    autoFocus
+                  />
+                  <button
+                    onClick={submitAnthropicCode}
+                    disabled={!anthropicCodeInput.trim() || oauthLoading === "anthropic"}
+                    className="px-4 py-2 text-sm font-medium rounded-lg bg-[var(--purple-accent)] text-white hover:opacity-90 disabled:opacity-40 transition-colors"
+                  >
+                    {oauthLoading === "anthropic" ? "..." : "Connect"}
+                  </button>
+                </div>
+                <button
+                  onClick={() => { setAnthropicCodePending(false); setAnthropicCodeInput(""); }}
+                  className="mt-2 text-xs text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => connectWithOAuth("anthropic")}
+                disabled={oauthLoading !== null}
+                className="w-full flex items-center gap-4 p-3 rounded-lg text-left transition-colors bg-black/[0.03] hover:bg-black/[0.07] disabled:opacity-50"
+              >
+                <div className="w-9 h-9 rounded-md bg-[var(--purple-accent)]/10 flex items-center justify-center font-semibold text-[var(--purple-accent)]">
+                  A
+                </div>
+                <div className="flex-1">
+                  <p className="font-medium text-[var(--text-primary)]">Sign in with Claude</p>
+                  <p className="text-xs text-[var(--text-tertiary)]">Use your existing subscription</p>
+                </div>
+                {oauthLoading === "anthropic" ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-[var(--text-tertiary)]" />
+                ) : (
+                  <ExternalLink className="w-4 h-4 text-[var(--text-tertiary)]" />
+                )}
+              </button>
+            )}
+
+            {/* OpenAI */}
+            <button
+              onClick={() => connectWithOAuth("openai")}
+              disabled={oauthLoading !== null}
+              className="w-full flex items-center gap-4 p-3 rounded-lg text-left transition-colors bg-black/[0.03] hover:bg-black/[0.07] disabled:opacity-50"
+            >
+              <div className="w-9 h-9 rounded-md bg-[var(--purple-accent)]/10 flex items-center justify-center font-semibold text-[var(--purple-accent)]">
+                O
+              </div>
+              <div className="flex-1">
+                <p className="font-medium text-[var(--text-primary)]">Sign in with OpenAI</p>
+                <p className="text-xs text-[var(--text-tertiary)]">Use your existing subscription</p>
+              </div>
+              {oauthLoading === "openai" ? (
+                <Loader2 className="w-4 h-4 animate-spin text-[var(--text-tertiary)]" />
+              ) : (
+                <ExternalLink className="w-4 h-4 text-[var(--text-tertiary)]" />
+              )}
+            </button>
+          </div>
+
+          <div className="flex items-center gap-3 my-4">
+            <div className="flex-1 h-px bg-black/10" />
+            <span className="text-xs text-[var(--text-tertiary)] font-medium">or use an API key</span>
+            <div className="flex-1 h-px bg-black/10" />
+          </div>
+
+          {/* API key buttons */}
+          <div className="space-y-2">
             {PROVIDERS.map(p => (
               <button key={p.id} onClick={() => { setSelectedProvider(p); setShowKeyModal(true); }}
                 className="w-full flex items-center gap-4 p-3 rounded-lg text-left transition-colors hover:bg-black/5">
@@ -2166,7 +2263,7 @@ export function Chat({
               </button>
             ))}
           </div>
-          <p className="text-xs mt-6 text-[var(--text-tertiary)]">Your API keys are stored locally and securely.</p>
+          <p className="text-xs mt-6 text-[var(--text-tertiary)]">Your credentials are stored locally and securely.</p>
         </div>
       </div>
       {showKeyModal && selectedProvider && <ApiKeyModal />}
@@ -2249,13 +2346,65 @@ export function Chat({
       setKeyInput("");
       setShowKeyModal(false);
       if (gatewayRunning) {
-        await invoke("restart_gateway");
+        await invoke("restart_gateway", { model: selectedModel });
       } else {
-        await invoke("start_gateway");
+        await invoke("start_gateway", { model: selectedModel });
       }
     } catch (e) {
       console.error("Failed to set API key:", e);
       setError("Failed to save API key");
+    }
+  }
+
+  async function connectWithOAuth(provider: "anthropic" | "openai") {
+    setOauthLoading(provider);
+    setError(null);
+    try {
+      if (provider === "anthropic") {
+        // Phase 1: Open browser — user copies code from Anthropic's page
+        await invoke("start_anthropic_oauth");
+        setAnthropicCodePending(true);
+        setAnthropicCodeInput("");
+        setOauthLoading(null);
+        return;
+      }
+      // OpenAI: single-step localhost callback
+      await invoke<{ access_token: string; provider: string }>("start_openai_oauth");
+      setConnectedProvider(provider);
+      if (gatewayRunning) {
+        await invoke("restart_gateway", { model: selectedModel });
+      } else {
+        await invoke("start_gateway", { model: selectedModel });
+      }
+    } catch (e) {
+      console.error(`OAuth login failed for ${provider}:`, e);
+      setError(typeof e === "string" ? e : `OAuth login failed`);
+    } finally {
+      setOauthLoading(null);
+    }
+  }
+
+  async function submitAnthropicCode() {
+    if (!anthropicCodeInput.trim()) return;
+    setOauthLoading("anthropic");
+    setError(null);
+    try {
+      await invoke<{ access_token: string; provider: string }>("complete_anthropic_oauth", {
+        codeState: anthropicCodeInput.trim(),
+      });
+      setAnthropicCodePending(false);
+      setAnthropicCodeInput("");
+      setConnectedProvider("anthropic");
+      if (gatewayRunning) {
+        await invoke("restart_gateway", { model: selectedModel });
+      } else {
+        await invoke("start_gateway", { model: selectedModel });
+      }
+    } catch (e) {
+      console.error("Anthropic OAuth code exchange failed:", e);
+      setError(typeof e === "string" ? e : "Failed to exchange authorization code");
+    } finally {
+      setOauthLoading(null);
     }
   }
 
@@ -2282,6 +2431,9 @@ export function Chat({
               {currentSession ? sessionTitle(sessions.find(s => s.key === currentSession) || { key: currentSession }) : "New Chat"}
             </span>
           </div>
+        {onModelChange && (
+          <ModelSelector selectedModel={selectedModel} onModelChange={onModelChange} compact useLocalKeys={useLocalKeys} connectedProviders={useLocalKeys ? connectedProviders : undefined} />
+        )}
         <div className="flex items-center gap-3 px-2">
           <div className="flex items-center gap-1.5">
             <div className={`w-1.5 h-1.5 rounded-full ${

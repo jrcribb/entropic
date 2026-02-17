@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ArrowRight, ArrowLeft, Sparkles } from "lucide-react";
 import { saveProfile, setOnboardingComplete, saveOnboardingData } from "../lib/profile";
 import { clientLog } from "../lib/clientLog";
@@ -152,7 +153,19 @@ Be friendly, knowledgeable, and ready to help.
 
   return (
     <div className="h-screen w-screen flex flex-col items-center justify-center bg-[var(--bg-primary)] transition-colors duration-500">
-      
+
+      {/* Drag region for window movement */}
+      <div
+        data-tauri-drag-region
+        onMouseDown={(e) => {
+          if (e.button !== 0) return;
+          if ((e.target as HTMLElement).closest("button, a, input, select, textarea, [role='button']")) return;
+          e.preventDefault();
+          getCurrentWindow().startDragging();
+        }}
+        className="absolute top-0 left-0 right-0 h-12"
+      />
+
       {/* Progress Indicator - Minimalist at top */}
       <div className="absolute top-12 flex gap-3">
         {steps.map((_, index) => (

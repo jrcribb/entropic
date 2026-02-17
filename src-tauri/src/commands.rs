@@ -611,6 +611,8 @@ pub struct AppState {
     pub active_provider: Mutex<Option<String>>,
     pub whatsapp_login: Mutex<WhatsAppLoginCache>,
     pub bridge_server_started: Mutex<bool>,
+    /// Stores the PKCE verifier for the in-flight Anthropic OAuth flow
+    pub anthropic_oauth_verifier: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -630,6 +632,7 @@ impl Default for AppState {
             active_provider: Mutex::new(None),
             whatsapp_login: Mutex::new(WhatsAppLoginCache::default()),
             bridge_server_started: Mutex::new(false),
+            anthropic_oauth_verifier: Mutex::new(None),
         }
     }
 }
@@ -900,12 +903,21 @@ pub struct ClawhubSkillDetails {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OAuthKeyMeta {
+    refresh_token: String,
+    expires_at: u64,
+    source: String, // "claude_code" or "openai_codex"
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct StoredAuth {
     version: u8,
     keys: HashMap<String, String>,
     active_provider: Option<String>,
     gateway_token: Option<String>,
     agent_settings: Option<StoredAgentSettings>,
+    #[serde(default)]
+    oauth_metadata: HashMap<String, OAuthKeyMeta>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1018,6 +1030,7 @@ impl Default for StoredAuth {
             active_provider: None,
             gateway_token: None,
             agent_settings: None,
+            oauth_metadata: HashMap::new(),
         }
     }
 }
@@ -1859,6 +1872,7 @@ fn append_nova_skills_mount(docker_args: &mut Vec<String>) {
     });
 
     if let Some(host_path) = path {
+        println!("[Nova] Mounting nova-skills from: {}", host_path);
         docker_args.push("-v".to_string());
         docker_args.push(format!("{}:/data/nova-skills:ro", host_path));
         docker_args.push("-e".to_string());
@@ -2168,6 +2182,7 @@ Use it for durable decisions, preferences, and facts that should persist across 
         "# {date}\n\n- [ ] Add raw notes from this session here while they are still fresh.\n",
         date = today
     );
+    let thinking_level_env = read_container_env("NOVA_THINKING_LEVEL");
     let fingerprint_payload = serde_json::json!({
         "container_id": container_id,
         "proxy_mode": proxy_mode,
@@ -2176,6 +2191,7 @@ Use it for durable decisions, preferences, and facts that should persist across 
         "image_model": &image_model,
         "web_base_url": &web_base_url,
         "openai_key_for_lancedb": &openai_key_for_lancedb,
+        "thinking_level": &thinking_level_env,
         "settings": &settings,
         "heartbeat_body": &hb_body,
         "tools_body": &tools_body,
@@ -2313,6 +2329,10 @@ Use it for durable decisions, preferences, and facts that should persist across 
                 );
             }
         }
+    } else {
+        // Non-proxy mode: remove openrouter config to avoid validation errors
+        // (an empty models.providers.openrouter object causes "baseUrl required" validation failure)
+        remove_openclaw_config_value(&mut cfg, &["models", "providers", "openrouter"]);
     }
     let memory_enabled = settings.memory_enabled;
     let memory_slot = if !memory_enabled {
@@ -2718,7 +2738,83 @@ Use it for durable decisions, preferences, and facts that should persist across 
         disable_legacy_messaging_config(&mut cfg);
     }
 
+    // Set thinking level from NOVA_THINKING_LEVEL env var (set by start_gateway from model suffix)
+    // Use the value already read for the fingerprint to avoid a second docker exec
+    if let Some(ref thinking_level) = thinking_level_env {
+        let level = thinking_level.trim();
+        println!(
+            "[Nova] apply_agent_settings: NOVA_THINKING_LEVEL={:?}, setting thinkingDefault={}",
+            thinking_level,
+            if !level.is_empty() && level != "off" { level } else { "off" }
+        );
+        if !level.is_empty() && level != "off" {
+            set_openclaw_config_value(
+                &mut cfg,
+                &["agents", "defaults", "thinkingDefault"],
+                serde_json::json!(level),
+            );
+        } else {
+            set_openclaw_config_value(
+                &mut cfg,
+                &["agents", "defaults", "thinkingDefault"],
+                serde_json::json!("off"),
+            );
+        }
+    } else {
+        println!("[Nova] apply_agent_settings: NOVA_THINKING_LEVEL not set in container env");
+    }
+
+    println!(
+        "[Nova] apply_agent_settings: writing openclaw.json with model={:?}",
+        cfg.get("agents")
+            .and_then(|a| a.get("defaults"))
+            .and_then(|d| d.get("model"))
+    );
     write_openclaw_config(&cfg)?;
+
+    // Write OpenAI Codex OAuth credentials to auth-profiles.json if available
+    // (env vars don't work for Codex OAuth — OpenClaw needs auth-profiles.json)
+    // OpenClaw reads auth-profiles.json from: $STATE_DIR/agents/main/agent/auth-profiles.json
+    {
+        let stored = load_auth(app);
+        let openai_meta = stored.oauth_metadata.get("openai");
+        let openai_key = stored.keys.get("openai");
+        if let (Some(meta), Some(access_token)) = (openai_meta, openai_key) {
+            if meta.source == "openai_codex" && !access_token.is_empty() {
+                println!(
+                    "[Nova] Writing OpenAI Codex OAuth credentials to auth-profiles.json (token len={})",
+                    access_token.len()
+                );
+                let auth_profiles = serde_json::json!({
+                    "version": 1,
+                    "profiles": {
+                        "openai-codex:nova": {
+                            "type": "oauth",
+                            "provider": "openai-codex",
+                            "access": access_token,
+                            "refresh": meta.refresh_token,
+                            "expires": meta.expires_at / 1000 // Convert ms to seconds
+                        }
+                    }
+                });
+                let payload = serde_json::to_string_pretty(&auth_profiles)
+                    .map_err(|e| e.to_string())?;
+                if let Err(e) = write_container_file(
+                    "/home/node/.openclaw/agents/main/agent/auth-profiles.json",
+                    &payload,
+                ) {
+                    println!("[Nova] Failed to write auth-profiles.json: {}", e);
+                }
+            }
+        } else {
+            println!(
+                "[Nova] No OpenAI Codex OAuth credentials found (meta={}, key={})",
+                stored.oauth_metadata.contains_key("openai"),
+                stored.keys.contains_key("openai"),
+            );
+        }
+    }
+
     {
         let mut cache = applied_agent_settings_fingerprint()
             .lock()
@@ -3091,7 +3187,6 @@ fn normalize_openclaw_config(cfg: &mut serde_json::Value) {
         &["channels", "whatsapp"],
         &["channels", "imessage"],
         &["cron"],
-        &["models", "providers", "openrouter"],
     ];
 
     for path in paths {
@@ -3743,6 +3838,7 @@ pub fn init_state(app: &AppHandle) -> AppState {
         active_provider: Mutex::new(stored.active_provider.clone()),
         whatsapp_login: Mutex::new(WhatsAppLoginCache::default()),
         bridge_server_started: Mutex::new(false),
+        anthropic_oauth_verifier: Mutex::new(None),
     }
 }
 
@@ -3823,13 +3919,23 @@ pub async fn set_api_key(
     provider: String,
     key: String,
 ) -> Result<(), String> {
+    let is_empty = key.is_empty();
     let mut keys = state.api_keys.lock().map_err(|e| e.to_string())?;
-    keys.insert(provider.clone(), key);
+    if is_empty {
+        keys.remove(&provider);
+    } else {
+        keys.insert(provider.clone(), key);
+    }
     let mut active = state.active_provider.lock().map_err(|e| e.to_string())?;
-    *active = Some(provider.clone());
+    if !is_empty {
+        *active = Some(provider.clone());
+    }
     let mut stored = load_auth(&app);
     stored.keys = keys.clone();
     stored.active_provider = active.clone();
+    if is_empty {
+        stored.oauth_metadata.remove(&provider);
+    }
     save_auth(&app, &stored)?;
     Ok(())
 }
@@ -3883,7 +3989,7 @@ pub async fn get_auth_state(state: State<'_, AppState>) -> Result<AuthState, Str
 }
 
 #[tauri::command]
-pub async fn start_gateway(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn start_gateway(app: AppHandle, state: State<'_, AppState>, model: Option<String>) -> Result<(), String> {
     let startup_started = Instant::now();
     let _start_guard = gateway_start_lock().lock().await;
     // Get API keys from state
@@ -3940,7 +4046,59 @@ pub async fn start_gateway(app: AppHandle, state: State<'_, AppState>) -> Result
 
     let gateway_token = expected_gateway_token(&app)?;
 
-    // Check if nova-openclaw container exists
+    let has_any_local_api_key = api_keys.contains_key("anthropic")
+        || api_keys.contains_key("openai")
+        || api_keys.contains_key("google");
+    if !has_any_local_api_key {
+        return Err(
+            "No local API key configured. Add an Anthropic/OpenAI/Google key in Settings, or sign in and disable 'Use Local Keys'."
+                .to_string(),
+        );
+    }
+
+    // Resolve model early so we can compare against the running container.
+    // Use the model passed from frontend if provided, otherwise fall back based on active provider
+    let model_full: String = if let Some(ref m) = model {
+        if !m.is_empty() {
+            m.clone()
+        } else {
+            "anthropic/claude-opus-4-6:thinking".to_string()
+        }
+    } else {
+        match active_provider.as_deref() {
+            Some("anthropic") if api_keys.contains_key("anthropic") => {
+                "anthropic/claude-opus-4-6:thinking".to_string()
+            }
+            Some("openai") if api_keys.contains_key("openai") => {
+                "openai-codex/gpt-5.3-codex".to_string()
+            }
+            Some("google") if api_keys.contains_key("google") => {
+                "google/gemini-2.5-pro".to_string()
+            }
+            _ if api_keys.contains_key("anthropic") => {
+                "anthropic/claude-opus-4-6:thinking".to_string()
+            }
+            _ if api_keys.contains_key("openai") => "openai-codex/gpt-5.3-codex".to_string(),
+            _ if api_keys.contains_key("google") => "google/gemini-2.5-pro".to_string(),
+            _ => "anthropic/claude-opus-4-6:thinking".to_string(),
+        }
+    };
+
+    // Parse model string: "provider/model-id:param" -> base model + optional params
+    // Supported suffixes: ":thinking" (Anthropic), ":reasoning=level" (OpenAI)
+    let (base_model, model_params) = if let Some(colon_pos) = model_full.find(':') {
+        (&model_full[..colon_pos], Some(&model_full[colon_pos + 1..]))
+    } else {
+        (model_full.as_str(), None)
+    };
+
+    // Derive thinking / reasoning env vars from suffix
+    let thinking_enabled = model_params == Some("thinking");
+    let reasoning_effort = model_params
+        .and_then(|p| p.strip_prefix("reasoning="))
+        .unwrap_or("");
+
+    // Check if nova-openclaw container is already running with matching config
     let check = docker_command()
         .args(["ps", "-q", "-f", "name=nova-openclaw"])
         .output()
@@ -3949,16 +4107,27 @@ pub async fn start_gateway(app: AppHandle, state: State<'_, AppState>) -> Result
     if !check.stdout.is_empty() {
         let current_gateway_token = read_container_env("OPENCLAW_GATEWAY_TOKEN");
         let current_schema = read_container_env("NOVA_GATEWAY_SCHEMA_VERSION");
-        if current_gateway_token.as_deref() == Some(gateway_token.as_str())
+        let current_model = read_container_env("OPENCLAW_MODEL");
+        let current_proxy_mode = read_container_env("NOVA_PROXY_MODE");
+        // Check if the Anthropic auth type matches (OAuth token vs API key)
+        let has_oauth_token = read_container_env("ANTHROPIC_OAUTH_TOKEN").is_some();
+        let wants_oauth_token = api_keys.get("anthropic").map_or(false, |k| k.starts_with("sk-ant-oat01-"));
+        let auth_type_matches = has_oauth_token == wants_oauth_token;
+        // Only reuse the running container if token, schema, model, and auth type all match
+        // AND the container isn't a stale proxy-mode instance (start_gateway = local keys).
+        let is_proxy_container = current_proxy_mode.as_deref() == Some("1");
+        if !is_proxy_container
+            && auth_type_matches
+            && current_gateway_token.as_deref() == Some(gateway_token.as_str())
             && current_schema.as_deref() == Some(NOVA_GATEWAY_SCHEMA_VERSION)
+            && current_model.as_deref() == Some(base_model)
         {
             apply_agent_settings(&app, &state)?;
             start_scanner_sidecar_background();
             return Ok(());
         }
 
-        // Running container was created without Nova-managed gateway token env.
-        // Recreate it so auth mode token can be satisfied.
+        // Container config doesn't match — recreate it.
         let _ = docker_command()
             .args(["rm", "-f", "nova-openclaw"])
             .output();
@@ -3971,20 +4140,17 @@ pub async fn start_gateway(app: AppHandle, state: State<'_, AppState>) -> Result
         .map_err(|e| format!("Failed to check container: {}", e))?;
 
     if !check_all.stdout.is_empty() {
-        // Recreate stale containers so required env vars (like OPENCLAW_GATEWAY_TOKEN)
-        // are always refreshed to Nova-managed defaults.
         let _ = docker_command()
             .args(["rm", "-f", "nova-openclaw"])
             .output();
     }
 
-    // Container doesn't exist - need to create it
     // Create network if it doesn't exist
     let _ = docker_command()
         .args(["network", "create", "nova-net"])
-        .output(); // Ignore error if already exists
+        .output();
 
-    // Ensure runtime image is available (load from bundle or pull from registry)
+    // Ensure runtime image is available
     let image_started = Instant::now();
     ensure_runtime_image()?;
     println!(
@@ -3992,31 +4158,16 @@ pub async fn start_gateway(app: AppHandle, state: State<'_, AppState>) -> Result
         image_started.elapsed().as_millis()
     );
 
-    let has_any_local_api_key = api_keys.contains_key("anthropic")
-        || api_keys.contains_key("openai")
-        || api_keys.contains_key("google");
-    if !has_any_local_api_key {
-        return Err(
-            "No local API key configured. Add an Anthropic/OpenAI/Google key in Settings, or sign in and disable 'Use Local Keys'."
-                .to_string(),
-        );
-    }
-
-    // Determine which provider/model to use based on active provider, then fall back
-    let model = match active_provider.as_deref() {
-        Some("anthropic") if api_keys.contains_key("anthropic") => {
-            "anthropic/claude-sonnet-4-20250514"
-        }
-        Some("openai") if api_keys.contains_key("openai") => "openai/gpt-4o",
-        Some("google") if api_keys.contains_key("google") => "google/gemini-2.0-flash",
-        _ if api_keys.contains_key("anthropic") => "anthropic/claude-sonnet-4-20250514",
-        _ if api_keys.contains_key("openai") => "openai/gpt-4o",
-        _ if api_keys.contains_key("google") => "google/gemini-2.0-flash",
-        _ => "anthropic/claude-sonnet-4-20250514",
+    // Resolve thinking level from model suffix for openclaw.json thinkingDefault
+    let thinking_level = if thinking_enabled {
+        "high"
+    } else if !reasoning_effort.is_empty() {
+        reasoning_effort // "low", "medium", "high", "xhigh"
+    } else {
+        "off"
     };
 
     // Build docker run command - pass API keys as env vars
-    // The entrypoint.sh script creates auth-profiles.json from these
     let mut env_entries: Vec<(&str, &str)> = vec![
         (
             "OPENCLAW_GATEWAY_TOKEN",
@@ -4026,15 +4177,29 @@ pub async fn start_gateway(app: AppHandle, state: State<'_, AppState>) -> Result
             "NOVA_GATEWAY_SCHEMA_VERSION",
             NOVA_GATEWAY_SCHEMA_VERSION,
         ),
-        ("OPENCLAW_MODEL", model),
+        // OPENCLAW_MODEL is read by apply_agent_settings to write openclaw.json config
+        ("OPENCLAW_MODEL", base_model),
         ("OPENCLAW_MEMORY_SLOT", memory_slot),
+        // NOVA_THINKING_LEVEL is read by apply_agent_settings to set thinkingDefault in config
+        ("NOVA_THINKING_LEVEL", thinking_level),
     ];
 
+    // Anthropic: use ANTHROPIC_OAUTH_TOKEN for OAuth tokens (sk-ant-oat01-...), ANTHROPIC_API_KEY for regular keys
     if let Some(key) = api_keys.get("anthropic") {
-        env_entries.push(("ANTHROPIC_API_KEY", key.as_str()));
+        if key.starts_with("sk-ant-oat01-") {
+            env_entries.push(("ANTHROPIC_OAUTH_TOKEN", key.as_str()));
+        } else {
+            env_entries.push(("ANTHROPIC_API_KEY", key.as_str()));
+        }
     }
+    // OpenAI: regular API key (Codex OAuth handled via auth-profiles.json in apply_agent_settings)
     if let Some(key) = api_keys.get("openai") {
-        env_entries.push(("OPENAI_API_KEY", key.as_str()));
+        // JWT tokens from Codex OAuth are NOT valid as OPENAI_API_KEY;
+        // they need to be in auth-profiles.json as openai-codex credentials.
+        // Only set OPENAI_API_KEY for regular sk- keys.
+        if key.starts_with("sk-") {
+            env_entries.push(("OPENAI_API_KEY", key.as_str()));
+        }
     }
     if let Some(key) = api_keys.get("google") {
         env_entries.push(("GEMINI_API_KEY", key.as_str()));
@@ -4099,7 +4264,7 @@ pub async fn start_gateway(app: AppHandle, state: State<'_, AppState>) -> Result
     }
 
     // Create and start container with hardened settings
-    println!("[Nova] Starting gateway container with model: {}", model);
+    println!("[Nova] Starting gateway container with model: {}", model_full);
     println!(
         "[Nova] Docker command: docker {}",
         docker_args_for_log(&docker_args)
@@ -4194,6 +4359,20 @@ pub async fn start_gateway(app: AppHandle, state: State<'_, AppState>) -> Result
             }
         }
     }
+    // Re-apply settings AFTER health check passes.
+    // OpenClaw's initialization may overwrite files we wrote earlier (e.g., auth-profiles.json
+    // and config fields like thinkingDefault). Re-applying now ensures our settings stick.
+    {
+        let mut cache = applied_agent_settings_fingerprint()
+            .lock()
+            .map_err(|e| e.to_string())?;
+        *cache = None;
+    }
+    apply_agent_settings(&app, &state)?;
+    println!(
+        "[Nova] Startup timing: post_health_config applied"
+    );
+
     start_scanner_sidecar_background();
     println!(
         "[Nova] Startup timing: health={}ms total={}ms",
@@ -4630,8 +4809,55 @@ pub async fn start_gateway_with_proxy(
     Ok(())
 }
 
+/// Hot-swap the model in openclaw.json without restarting the container.
+/// Only works for same-provider changes (API keys stay the same).
 #[tauri::command]
-pub async fn restart_gateway(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub fn update_gateway_model(model: String) -> Result<(), String> {
+    let base_model = model.split(':').next().unwrap_or(&model);
+    let thinking_enabled = model.contains(":thinking");
+    let reasoning_effort = model
+        .split(':')
+        .find_map(|s| s.strip_prefix("reasoning="))
+        .unwrap_or("");
+
+    let thinking_level = if thinking_enabled {
+        "high"
+    } else if !reasoning_effort.is_empty() {
+        reasoning_effort
+    } else {
+        "off"
+    };
+
+    let mut cfg = read_openclaw_config();
+    set_openclaw_config_value(
+        &mut cfg,
+        &["agents", "defaults", "model", "primary"],
+        serde_json::json!(base_model),
+    );
+
+    if thinking_level != "off" {
+        set_openclaw_config_value(
+            &mut cfg,
+            &["agents", "defaults", "thinkingDefault"],
+            serde_json::json!(thinking_level),
+        );
+    } else {
+        set_openclaw_config_value(
+            &mut cfg,
+            &["agents", "defaults", "thinkingDefault"],
+            serde_json::json!("off"),
+        );
+    }
+
+    println!(
+        "[Nova] update_gateway_model: hot-swapping model to {} (thinking={})",
+        base_model, thinking_level
+    );
+    write_openclaw_config(&cfg)
+}
+
+#[tauri::command]
+pub async fn restart_gateway(app: AppHandle, state: State<'_, AppState>, model: Option<String>) -> Result<(), String> {
     // Stop and remove existing container (to pick up new env vars)
     let _ = docker_command().args(["stop", "nova-openclaw"]).output();
     let _ = docker_command()
@@ -4639,7 +4865,7 @@ pub async fn restart_gateway(app: AppHandle, state: State<'_, AppState>) -> Resu
         .output();
 
     // Start with current API keys
-    start_gateway(app, state).await
+    start_gateway(app, state, model).await
 }
 
 #[tauri::command]
@@ -6264,7 +6490,7 @@ async fn run_first_time_setup_internal(
                 let mut progress = state.setup_progress.lock().map_err(|e| e.to_string())?;
                 *progress = SetupProgress {
                     stage: "vm".to_string(),
-                    message: "Starting container runtime (first time may download ~100MB)..."
+                    message: "Starting container runtime..."
                         .to_string(),
                     percent: 10,
                     complete: false,
@@ -6272,8 +6498,76 @@ async fn run_first_time_setup_internal(
                 };
             }
 
-            // Start Colima - this can take 30-60 seconds on first run
-            if let Err(e) = runtime.start_colima() {
+            // Start Colima in a background thread so we can monitor download progress
+            let resources_dir = app.path().resource_dir().unwrap_or_default();
+            let colima_result = std::sync::Arc::new(std::sync::Mutex::new(None::<Result<(), String>>));
+            let colima_result_writer = colima_result.clone();
+            let colima_thread = std::thread::spawn(move || {
+                let rt = Runtime::new(resources_dir);
+                let result = rt.start_colima().map_err(|e| format!("{}", e));
+                *colima_result_writer.lock().unwrap() = Some(result);
+            });
+
+            // Monitor download progress while colima starts
+            // Colima downloads VM image to ~/.cache/colima/caches/*.downloading
+            let cache_dir = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".cache/colima/caches");
+            const EXPECTED_DOWNLOAD_SIZE: u64 = 280 * 1024 * 1024; // ~280MB qcow2
+
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                // Check if colima finished
+                if colima_result.lock().unwrap().is_some() {
+                    break;
+                }
+
+                // Check for .downloading files and report progress
+                let download_size = std::fs::read_dir(&cache_dir)
+                    .ok()
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .filter(|e| e.path().extension().map_or(false, |ext| ext == "downloading"))
+                            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+
+                let (message, percent) = if download_size > 0 {
+                    let mb = download_size / (1024 * 1024);
+                    let pct = std::cmp::min(
+                        35,
+                        10 + (download_size * 25 / EXPECTED_DOWNLOAD_SIZE) as u8,
+                    );
+                    (format!("Downloading VM image... ({} MB)", mb), pct)
+                } else {
+                    // No download file — either hasn't started or already finished
+                    ("Starting container runtime...".to_string(), 10)
+                };
+
+                if let Ok(mut progress) = state.setup_progress.lock() {
+                    *progress = SetupProgress {
+                        stage: "vm".to_string(),
+                        message,
+                        percent,
+                        complete: false,
+                        error: None,
+                    };
+                }
+            }
+
+            // Collect the result
+            let _ = colima_thread.join();
+            let result = colima_result
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_else(|| Err("Colima thread did not produce a result".to_string()));
+
+            if let Err(e) = result {
                 let mut progress = state.setup_progress.lock().map_err(|e| e.to_string())?;
                 *progress = SetupProgress {
                     stage: "error".to_string(),
@@ -6577,6 +6871,19 @@ const AUTH_LOCALHOST_DEFAULT_PORT: u16 = 27100;
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
+
+// Anthropic (Claude Code) OAuth — two-phase flow: user copies code from Anthropic's page
+const ANTHROPIC_AUTH_URL: &str = "https://claude.ai/oauth/authorize";
+const ANTHROPIC_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference";
+const ANTHROPIC_OAUTH_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
+
+// OpenAI (Codex) OAuth — localhost callback flow
+const OPENAI_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
+const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_OAUTH_SCOPES: &str = "openid profile email offline_access";
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LocalhostAuthStart {
@@ -7188,4 +7495,462 @@ pub async fn refresh_google_token(
         token_type: data.token_type,
         expires_at,
     })
+}
+
+// =============================================================================
+// Provider OAuth (Claude Code / OpenAI Codex)
+// =============================================================================
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderOAuthResult {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: u64,
+    pub provider: String,
+}
+
+// =============================================================================
+// Anthropic OAuth — two-phase flow (user copies code from Anthropic's page)
+// =============================================================================
+
+#[tauri::command]
+pub async fn start_anthropic_oauth(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (verifier, challenge) = generate_pkce();
+
+    // Store verifier for the completion step
+    {
+        let mut v = state.anthropic_oauth_verifier.lock().map_err(|e| e.to_string())?;
+        *v = Some(verifier.clone());
+    }
+
+    // Build authorize URL — state IS the verifier (matches Claude Code / OpenClaw convention)
+    let mut url = Url::parse(ANTHROPIC_AUTH_URL)
+        .map_err(|_| "Failed to build OAuth URL".to_string())?;
+    url.query_pairs_mut()
+        .append_pair("code", "true")
+        .append_pair("client_id", ANTHROPIC_OAUTH_CLIENT_ID)
+        .append_pair("response_type", "code")
+        .append_pair("redirect_uri", ANTHROPIC_OAUTH_REDIRECT_URI)
+        .append_pair("scope", ANTHROPIC_OAUTH_SCOPES)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", &verifier);
+
+    app.opener()
+        .open_url(url.as_str(), None::<&str>)
+        .map_err(|e| format!("Failed to open browser: {}", e))?;
+
+    Ok(())
+}
+
+/// Parse a "code#state" string (or a full callback URL) into (code, state).
+fn parse_anthropic_code_state(input: &str) -> Result<(String, String), String> {
+    let text = input.trim().trim_matches('`');
+
+    // Try as URL first (user may paste the full callback URL)
+    if let Ok(url) = Url::parse(text) {
+        let code = url.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string());
+        let state = url.query_pairs().find(|(k, _)| k == "state").map(|(_, v)| v.to_string());
+        if let (Some(c), Some(s)) = (code, state) {
+            if !c.is_empty() && !s.is_empty() {
+                return Ok((c, s));
+            }
+        }
+    }
+
+    // Try as "code#state" token
+    if let Some(hash_pos) = text.find('#') {
+        let code = &text[..hash_pos];
+        let state = &text[hash_pos + 1..];
+        if code.len() >= 8 && state.len() >= 8 {
+            return Ok((code.to_string(), state.to_string()));
+        }
+    }
+
+    Err("Could not parse authorization code. Expected format: code#state".to_string())
+}
+
+#[tauri::command]
+pub async fn complete_anthropic_oauth(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    code_state: String,
+) -> Result<ProviderOAuthResult, String> {
+    let (code, returned_state) = parse_anthropic_code_state(&code_state)?;
+
+    // Retrieve and consume the stored verifier
+    let verifier = {
+        let mut v = state.anthropic_oauth_verifier.lock().map_err(|e| e.to_string())?;
+        v.take().ok_or("No pending Anthropic OAuth flow. Please click Sign In first.")?
+    };
+
+    // Validate state matches verifier (state == verifier in this flow)
+    if returned_state != verifier {
+        return Err("OAuth state mismatch — the code may have expired. Please try again.".to_string());
+    }
+
+    // Exchange code for tokens using JSON body (matching Claude Code / OpenClaw)
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({
+        "grant_type": "authorization_code",
+        "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+        "code": code,
+        "state": returned_state,
+        "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
+        "code_verifier": verifier,
+    });
+
+    let resp = client
+        .post(ANTHROPIC_TOKEN_URL)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Token exchange failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_else(|_| "unknown error".to_string());
+        return Err(format!("Token exchange failed: {}", text));
+    }
+
+    let token_data = resp
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(|e| format!("Failed to parse token response: {}", e))?;
+
+    let refresh_token = token_data.refresh_token.unwrap_or_default();
+    let expires_in = token_data.expires_in.unwrap_or(3600);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "Clock error".to_string())?
+        .as_millis() as u64;
+    // Subtract 5 minutes as buffer (matches OpenClaw convention)
+    let expires_at = now_ms.saturating_add(expires_in * 1000).saturating_sub(5 * 60 * 1000);
+
+    let provider = "anthropic".to_string();
+
+    // Store the token as an API key and save OAuth metadata
+    {
+        let mut keys = state.api_keys.lock().map_err(|e| e.to_string())?;
+        keys.insert(provider.clone(), token_data.access_token.clone());
+        let mut active = state.active_provider.lock().map_err(|e| e.to_string())?;
+        *active = Some(provider.clone());
+        let mut stored = load_auth(&app);
+        stored.keys = keys.clone();
+        stored.active_provider = active.clone();
+        stored.oauth_metadata.insert(
+            provider.clone(),
+            OAuthKeyMeta {
+                refresh_token: refresh_token.clone(),
+                expires_at,
+                source: "claude_code".to_string(),
+            },
+        );
+        save_auth(&app, &stored)?;
+    }
+
+    Ok(ProviderOAuthResult {
+        access_token: token_data.access_token,
+        refresh_token,
+        expires_at,
+        provider,
+    })
+}
+
+// =============================================================================
+// OpenAI OAuth — localhost callback flow (matches Codex CLI)
+// =============================================================================
+
+#[tauri::command]
+pub async fn start_openai_oauth(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ProviderOAuthResult, String> {
+    let (verifier, challenge) = generate_pkce();
+    let oauth_state = URL_SAFE_NO_PAD.encode({
+        let mut bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        bytes
+    });
+
+    // OpenAI requires the exact registered redirect URI on port 1455
+    let redirect_uri = "http://localhost:1455/auth/callback".to_string();
+    let listener = TcpListener::bind("127.0.0.1:1455")
+        .await
+        .map_err(|e| format!("Failed to bind OAuth callback server on port 1455 (is another app using it?): {}", e))?;
+
+    let mut url = Url::parse(OPENAI_AUTH_URL)
+        .map_err(|_| "Failed to build OAuth URL".to_string())?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", OPENAI_OAUTH_CLIENT_ID)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("scope", OPENAI_OAUTH_SCOPES)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", &oauth_state)
+        .append_pair("id_token_add_organizations", "true")
+        .append_pair("codex_cli_simplified_flow", "true")
+        .append_pair("originator", "pi");
+
+    app.opener()
+        .open_url(url.as_str(), None::<&str>)
+        .map_err(|e| format!("Failed to open browser: {}", e))?;
+
+    let code = wait_for_openai_oauth_callback(listener, &oauth_state).await?;
+
+    // Exchange code for tokens (form-encoded for OpenAI)
+    let client = reqwest::Client::new();
+    let params = vec![
+        ("client_id", OPENAI_OAUTH_CLIENT_ID.to_string()),
+        ("code", code),
+        ("grant_type", "authorization_code".to_string()),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", verifier),
+    ];
+    let resp = client
+        .post(OPENAI_TOKEN_URL)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("Token exchange failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_else(|_| "unknown error".to_string());
+        return Err(format!("Token exchange failed: {}", text));
+    }
+
+    let token_data = resp
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(|e| format!("Failed to parse token response: {}", e))?;
+
+    let refresh_token = token_data.refresh_token.unwrap_or_default();
+    let expires_in = token_data.expires_in.unwrap_or(3600);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "Clock error".to_string())?
+        .as_millis() as u64;
+    let expires_at = now_ms.saturating_add(expires_in * 1000);
+
+    let provider = "openai".to_string();
+
+    // Store the token as an API key and save OAuth metadata
+    {
+        let mut keys = state.api_keys.lock().map_err(|e| e.to_string())?;
+        keys.insert(provider.clone(), token_data.access_token.clone());
+        let mut active = state.active_provider.lock().map_err(|e| e.to_string())?;
+        *active = Some(provider.clone());
+        let mut stored = load_auth(&app);
+        stored.keys = keys.clone();
+        stored.active_provider = active.clone();
+        stored.oauth_metadata.insert(
+            provider.clone(),
+            OAuthKeyMeta {
+                refresh_token: refresh_token.clone(),
+                expires_at,
+                source: "openai_codex".to_string(),
+            },
+        );
+        save_auth(&app, &stored)?;
+    }
+
+    Ok(ProviderOAuthResult {
+        access_token: token_data.access_token,
+        refresh_token,
+        expires_at,
+        provider,
+    })
+}
+
+async fn wait_for_openai_oauth_callback(
+    listener: TcpListener,
+    expected_state: &str,
+) -> Result<String, String> {
+    let (mut socket, _) = timeout(Duration::from_secs(300), listener.accept())
+        .await
+        .map_err(|_| "Timed out waiting for OAuth callback".to_string())?
+        .map_err(|e| format!("Failed to accept OAuth callback: {}", e))?;
+
+    let mut buffer = vec![0u8; 8192];
+    let size = socket
+        .read(&mut buffer)
+        .await
+        .map_err(|e| format!("Failed to read OAuth callback: {}", e))?;
+    let request = String::from_utf8_lossy(&buffer[..size]);
+    let first_line = request.lines().next().unwrap_or("");
+    let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+    let url = Url::parse(&format!("http://127.0.0.1{}", path))
+        .map_err(|_| "Invalid OAuth callback URL".to_string())?;
+
+    if let Some(error) = url
+        .query_pairs()
+        .find(|(k, _)| k == "error")
+        .map(|(_, v)| v.to_string())
+    {
+        let html = oauth_callback_html(
+            "Nova OAuth",
+            "Connection failed",
+            "OpenAI returned an OAuth error. Close this tab and try again from Nova.",
+            false,
+        );
+        let _ = socket.write_all(oauth_html_response(html).as_bytes()).await;
+        return Err(format!("OAuth callback returned error: {}", error));
+    }
+
+    let code = match url.query_pairs().find(|(k, _)| k == "code").map(|(_, v)| v.to_string()) {
+        Some(c) => c,
+        None => {
+            let html = oauth_callback_html(
+                "Nova OAuth",
+                "Missing authorization code",
+                "No authorization code was returned. Close this tab and retry.",
+                false,
+            );
+            let _ = socket.write_all(oauth_html_response(html).as_bytes()).await;
+            return Err("OAuth callback missing code".to_string());
+        }
+    };
+
+    let cb_state = url
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
+    if cb_state != expected_state {
+        let html = oauth_callback_html(
+            "Nova OAuth",
+            "Security check failed",
+            "The OAuth state did not match. Please close this tab and retry from Nova.",
+            false,
+        );
+        let _ = socket.write_all(oauth_html_response(html).as_bytes()).await;
+        return Err("OAuth state mismatch".to_string());
+    }
+
+    let html = oauth_callback_html(
+        "Nova OAuth",
+        "OpenAI connected",
+        "Authentication is complete. You can return to Nova now.",
+        true,
+    );
+    let _ = socket.write_all(oauth_html_response(html).as_bytes()).await;
+
+    Ok(code)
+}
+
+#[tauri::command]
+pub async fn refresh_provider_token(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<ProviderOAuthResult, String> {
+    let token_url = match provider.as_str() {
+        "anthropic" => ANTHROPIC_TOKEN_URL,
+        "openai" => OPENAI_TOKEN_URL,
+        _ => return Err(format!("Unsupported OAuth provider: {}", provider)),
+    };
+    let client_id = match provider.as_str() {
+        "anthropic" => ANTHROPIC_OAUTH_CLIENT_ID,
+        "openai" => OPENAI_OAUTH_CLIENT_ID,
+        _ => unreachable!(),
+    };
+
+    let stored = load_auth(&app);
+    let meta = stored
+        .oauth_metadata
+        .get(&provider)
+        .ok_or_else(|| format!("No OAuth metadata for provider: {}", provider))?;
+
+    if meta.refresh_token.is_empty() {
+        return Err("No refresh token available. Please sign in again.".to_string());
+    }
+
+    let client = reqwest::Client::new();
+
+    // Anthropic uses JSON body; OpenAI uses form-encoded
+    let resp = if provider == "anthropic" {
+        let payload = serde_json::json!({
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "refresh_token": meta.refresh_token,
+        });
+        client
+            .post(token_url)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| format!("Token refresh failed: {}", e))?
+    } else {
+        let params = vec![
+            ("client_id", client_id.to_string()),
+            ("refresh_token", meta.refresh_token.clone()),
+            ("grant_type", "refresh_token".to_string()),
+        ];
+        client
+            .post(token_url)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| format!("Token refresh failed: {}", e))?
+    };
+
+    if !resp.status().is_success() {
+        let text = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "unknown error".to_string());
+        return Err(format!("Token refresh failed: {}", text));
+    }
+
+    let data = resp
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(|e| format!("Failed to parse refresh response: {}", e))?;
+
+    let new_refresh = data.refresh_token.unwrap_or_else(|| meta.refresh_token.clone());
+    let expires_in = data.expires_in.unwrap_or(3600);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "Clock error".to_string())?
+        .as_millis() as u64;
+    let expires_at = now_ms.saturating_add(expires_in * 1000);
+
+    // Update stored key and metadata
+    {
+        let mut keys = state.api_keys.lock().map_err(|e| e.to_string())?;
+        keys.insert(provider.clone(), data.access_token.clone());
+        let mut stored = load_auth(&app);
+        stored.keys = keys.clone();
+        stored.oauth_metadata.insert(
+            provider.clone(),
+            OAuthKeyMeta {
+                refresh_token: new_refresh.clone(),
+                expires_at,
+                source: meta.source.clone(),
+            },
+        );
+        save_auth(&app, &stored)?;
+    }
+
+    Ok(ProviderOAuthResult {
+        access_token: data.access_token,
+        refresh_token: new_refresh,
+        expires_at,
+        provider,
+    })
+}
+
+#[tauri::command]
+pub async fn get_oauth_status(app: AppHandle) -> Result<HashMap<String, String>, String> {
+    let stored = load_auth(&app);
+    let mut result = HashMap::new();
+    for (provider, meta) in &stored.oauth_metadata {
+        result.insert(provider.clone(), meta.source.clone());
+    }
+    Ok(result)
 }

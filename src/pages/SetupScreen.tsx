@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Shield, Loader2, CheckCircle2, XCircle, AlertTriangle, Copy } from "lucide-react";
 
 type SetupProgress = {
@@ -131,6 +132,18 @@ export function SetupScreen({ onComplete }: Props) {
 
   return (
     <div className="h-screen w-screen flex flex-col items-center justify-center bg-gradient-to-b from-gray-50 to-gray-100 p-8">
+      {/* Drag region for window movement */}
+      <div
+        data-tauri-drag-region
+        onMouseDown={(e) => {
+          if (e.button !== 0) return;
+          if ((e.target as HTMLElement).closest("button, a, input, select, textarea, [role='button']")) return;
+          e.preventDefault();
+          getCurrentWindow().startDragging();
+        }}
+        className="absolute top-0 left-0 right-0 h-12"
+      />
+
       {/* Logo and Title */}
       <div className="mb-12 text-center">
         <div className="w-20 h-20 bg-gradient-to-br from-violet-500 to-purple-600 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-lg">

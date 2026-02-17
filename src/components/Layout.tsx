@@ -30,10 +30,11 @@ import { platform } from "@tauri-apps/plugin-os";
 import { loadProfile, type AgentProfile } from "../lib/profile";
 
 function startDrag(e: React.MouseEvent) {
-  if (e.button === 0 && e.target === e.currentTarget) {
-    e.preventDefault();
-    getCurrentWindow().startDragging();
-  }
+  if (e.button !== 0) return;
+  const target = e.target as HTMLElement;
+  if (target.closest("button, a, input, select, textarea, [role='button']")) return;
+  e.preventDefault();
+  getCurrentWindow().startDragging();
 }
 
 export type Page = "chat" | "store" | "skills" | "channels" | "files" | "tasks" | "logs" | "settings" | "billing";
@@ -242,9 +243,9 @@ export function Layout({
               sidebarCollapsed ? "justify-center flex-1" : "gap-3 flex-1 min-w-0"
             )}
           >
-            <img src={novaLogo} alt="Nova" className="w-8 h-8 rounded-lg shadow-md" />
+            <img src={novaLogo} alt="Nova" className="w-8 h-8 rounded-lg shadow-md pointer-events-none" />
             {!sidebarCollapsed && (
-              <div className="font-semibold text-lg tracking-tight text-[var(--text-primary)]">
+              <div className="font-semibold text-lg tracking-tight text-[var(--text-primary)] pointer-events-none">
                 Nova
               </div>
             )}
@@ -453,6 +454,12 @@ export function Layout({
 
       {/* Main Content Area - The "Content Card" */}
       <div className="flex-1 h-screen p-2 pl-0 overflow-hidden flex flex-col">
+        {/* Drag strip above the card */}
+        <div
+          data-tauri-drag-region
+          onMouseDown={startDrag}
+          className="h-2 flex-shrink-0 ml-2"
+        />
         {/* The Card */}
         <main className="flex-1 bg-white rounded-2xl shadow-sm border border-[var(--border-subtle)] overflow-hidden flex flex-col relative ml-2">
           <div className="absolute inset-0 overflow-y-auto scroll-smooth">
