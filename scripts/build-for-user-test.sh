@@ -23,6 +23,24 @@ cd "$PROJECT_ROOT"
 echo "📁 Working directory: $PROJECT_ROOT"
 echo ""
 
+DOCKER_CHECK_OUT="${TMPDIR:-/tmp}/docker-check.out"
+DOCKER_CHECK_ERR="${TMPDIR:-/tmp}/docker-check.err"
+
+cleanup_docker_check() {
+    rm -f "$DOCKER_CHECK_OUT" "$DOCKER_CHECK_ERR"
+}
+
+docker_info_check() {
+    docker info >"$DOCKER_CHECK_OUT" 2>"$DOCKER_CHECK_ERR"
+}
+
+try_docker_context() {
+    local context="$1"
+    [ -n "$context" ] || return 1
+    docker context inspect "$context" >/dev/null 2>&1 || return 1
+    DOCKER_CONTEXT="$context" docker info >"$DOCKER_CHECK_OUT" 2>"$DOCKER_CHECK_ERR"
+}
+
 # ============================================
 # 0. PRE-FLIGHT CHECK: DOCKER RUNNING?
 # ============================================
@@ -41,35 +59,69 @@ echo ""
 
 # Try docker info and capture both stdout and stderr
 echo "  Running: docker info..."
-if docker info > /tmp/docker-check.out 2> /tmp/docker-check.err; then
+if docker_info_check; then
     echo "✅ Docker is running"
-else
-    echo ""
-    echo "❌ Docker is not running!"
-    echo ""
-    echo "Debug info:"
-    echo "  Exit code: $?"
-    if [ -s /tmp/docker-check.err ]; then
-        echo "  Error output:"
-        cat /tmp/docker-check.err | head -5 | sed 's/^/    /'
+    current_context="$(docker context show 2>/dev/null || true)"
+    if [ -n "$current_context" ]; then
+        echo "  Context: $current_context"
     fi
-    echo ""
-    echo "You need Docker running to build the OpenClaw runtime image."
-    echo "Choose one option:"
-    echo ""
-    echo "Option 1 - Use Docker Desktop (if installed):"
-    echo "   → Open Docker Desktop app"
-    echo ""
-    echo "Option 2 - Install Homebrew Colima temporarily:"
-    echo "   brew install colima"
-    echo "   colima start --cpu 4 --memory 8 --vm-type vz"
-    echo ""
-    echo "Then run this script again."
-    rm -f /tmp/docker-check.out /tmp/docker-check.err
-    exit 1
+else
+    docker_exit_code=$?
+    current_context="$(docker context show 2>/dev/null || true)"
+    if [ -n "$current_context" ]; then
+        echo "  ℹ️  Current Docker context '$current_context' is unreachable; trying fallbacks..."
+    fi
+
+    selected_context=""
+    for candidate_context in desktop-linux default; do
+        if [ "$candidate_context" = "$current_context" ]; then
+            continue
+        fi
+        echo "  Trying context: $candidate_context"
+        if try_docker_context "$candidate_context"; then
+            selected_context="$candidate_context"
+            export DOCKER_CONTEXT="$candidate_context"
+            break
+        fi
+    done
+
+    if [ -n "$selected_context" ]; then
+        echo "✅ Docker is running (using context: $selected_context)"
+    else
+        echo ""
+        echo "❌ Docker is not running!"
+        echo ""
+        echo "Debug info:"
+        echo "  Exit code: $docker_exit_code"
+        if [ -n "$current_context" ]; then
+            echo "  Current context: $current_context"
+        fi
+        if [ -s "$DOCKER_CHECK_ERR" ]; then
+            echo "  Error output:"
+            head -5 "$DOCKER_CHECK_ERR" | sed 's/^/    /'
+        fi
+        echo ""
+        echo "Available Docker contexts:"
+        docker context ls 2>/dev/null || true
+        echo ""
+        echo "You need Docker running to build the OpenClaw runtime image."
+        echo "Choose one option:"
+        echo ""
+        echo "Option 1 - Use Docker Desktop (if installed):"
+        echo "   docker context use desktop-linux"
+        echo "   or: docker context use default"
+        echo ""
+        echo "Option 2 - Install Homebrew Colima temporarily:"
+        echo "   brew install colima"
+        echo "   colima start --cpu 4 --memory 8 --vm-type vz"
+        echo ""
+        echo "Then run this script again."
+        cleanup_docker_check
+        exit 1
+    fi
 fi
 
-rm -f /tmp/docker-check.out /tmp/docker-check.err
+cleanup_docker_check
 
 # ============================================
 # 1. INSTALL DEPENDENCIES

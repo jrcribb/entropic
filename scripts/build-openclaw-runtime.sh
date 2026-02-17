@@ -110,6 +110,14 @@ resolve_working_docker_host() {
         return 0
     fi
 
+    # Prefer whatever Docker context is already active (e.g., Docker Desktop)
+    # before probing Colima sockets.
+    if "$DOCKER_BIN" info >/dev/null 2>&1; then
+        ACTIVE_DOCKER_HOST=""
+        ACTIVE_COLIMA_HOME=""
+        return 0
+    fi
+
     for profile in "${COLIMA_PROFILES[@]}"; do
         for home in "${COLIMA_HOME_CANDIDATES[@]-}"; do
             sock="$home/$profile/docker.sock"
@@ -121,12 +129,6 @@ resolve_working_docker_host() {
             fi
         done
     done
-
-    if "$DOCKER_BIN" info >/dev/null 2>&1; then
-        ACTIVE_DOCKER_HOST=""
-        ACTIVE_COLIMA_HOME=""
-        return 0
-    fi
 
     ACTIVE_DOCKER_HOST=""
     ACTIVE_COLIMA_HOME=""

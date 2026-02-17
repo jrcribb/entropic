@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import clsx from "clsx";
 import { CheckCircle2, Loader2, Search, ShieldCheck, Download, Star, ExternalLink, Box, Puzzle, Sparkles, ChevronRight, Info } from "lucide-react";
 import {
@@ -311,6 +312,7 @@ export function Store({
   const [clawhubDetailError, setClawhubDetailError] = useState<string | null>(null);
   const [removingSkill, setRemovingSkill] = useState<string | null>(null);
   const [skillScanResults, setSkillScanResults] = useState<Record<string, PluginScanResult>>({});
+  const [gatewayRestarting, setGatewayRestarting] = useState(false);
   const syncedIntegrationsRef = useRef<Set<string>>(new Set());
 
   // Redesign state
@@ -322,6 +324,16 @@ export function Store({
     refreshIntegrations();
     refreshSkills();
     refreshClawhubCatalog({ silent: true });
+
+    let unlistenRestarting: (() => void) | undefined;
+    listen("gateway-restarting", () => {
+      setGatewayRestarting(true);
+      setTimeout(() => setGatewayRestarting(false), 8000);
+    }).then((fn) => { unlistenRestarting = fn; });
+
+    return () => {
+      unlistenRestarting?.();
+    };
   }, []);
 
   useEffect(() => {
@@ -946,6 +958,12 @@ export function Store({
         </div>
       </div>
 
+      {gatewayRestarting && (
+        <div className="mb-3 flex items-center gap-2 px-4 py-2.5 rounded-xl bg-[var(--system-blue)]/10 text-[var(--system-blue)] text-sm font-semibold border border-[var(--system-blue)]/20">
+          <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+          Gateway is restarting to load the new skill&hellip;
+        </div>
+      )}
       <div className="flex-1 overflow-auto max-w-6xl w-full mx-auto">
         {activeTab === "plugins" ? (
           <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">

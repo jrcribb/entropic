@@ -7358,8 +7358,14 @@ pub async fn scan_and_install_clawhub_skill(
         );
     }
     // OpenClaw can cache plugin/tool registry at process start. If the
-    // gateway is running, recreate it so newly installed skills are loaded.
-    if container_running() {
+    // gateway is running in local-keys mode, recreate it so newly installed
+    // skills are loaded. Proxy-mode containers cannot be restarted this way
+    // (no local keys available); apply_agent_settings above already
+    // hot-registered the skill into the workspace config.
+    let is_proxy_mode = read_container_env("NOVA_PROXY_MODE").is_some();
+    if container_running() && !is_proxy_mode {
+        println!("[Nova] Restarting gateway to load newly installed skill...");
+        let _ = app.emit("gateway-restarting", ());
         if let Err(e) = restart_gateway(app.clone(), state, None).await {
             eprintln!(
                 "[Nova] Failed to restart gateway after skill install: {}",
