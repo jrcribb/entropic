@@ -1,13 +1,14 @@
 import { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Store } from "@tauri-apps/plugin-store";
-import { Power, Key, Shield, Sparkles, Cpu, Image, ChevronRight, User, Palette, LogIn, LogOut, Loader2 } from "lucide-react";
+import { Key, Shield, Sparkles, Cpu, Image, ChevronRight, User, Palette, ChevronDown, ScrollText, LogIn, LogOut, Loader2 } from "lucide-react";
 import clsx from "clsx";
 import { loadProfile, saveProfile, type AgentProfile } from "../lib/profile";
 import { useAuth } from "../contexts/AuthContext";
 import { ModelSelector } from "../components/ModelSelector";
 import { WALLPAPERS, DEFAULT_WALLPAPER_ID, getWallpaperById } from "../lib/wallpapers";
 import { getProxyUrl } from "../lib/auth";
+import { Logs } from "./Logs";
 
 type Props = {
   gatewayRunning: boolean;
@@ -167,6 +168,7 @@ export function Settings({
   }
 
   const [isEditingPersonality, setIsEditingPersonality] = useState(false);
+  const [logsExpanded, setLogsExpanded] = useState(false);
 
   const PERSONALITY_TEMPLATES = [
     { label: "Helpful Assistant", text: "You are a helpful, knowledgeable, and friendly AI assistant." },
@@ -649,6 +651,36 @@ export function Settings({
             )}
           </>
         )}
+      </SettingsGroup>
+
+      <SettingsGroup title="Diagnostics">
+        <div>
+          <button
+            onClick={() => setLogsExpanded((prev) => !prev)}
+            className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left"
+          >
+            <div className="flex items-center gap-3">
+              <div className="w-7 h-7 rounded-md bg-[var(--system-gray-6)] text-[var(--text-tertiary)] flex items-center justify-center flex-shrink-0">
+                <ScrollText className="w-4 h-4" />
+              </div>
+              <div>
+                <div className="text-[14px] font-medium text-[var(--text-primary)]">Local Logs</div>
+                <div className="text-[12px] text-[var(--text-secondary)]">Expand to view gateway diagnostics</div>
+              </div>
+            </div>
+            <ChevronDown
+              className={clsx(
+                "w-4 h-4 text-[var(--text-tertiary)] transition-transform duration-200",
+                logsExpanded ? "rotate-180" : ""
+              )}
+            />
+          </button>
+          {logsExpanded && (
+            <div className="px-4 pb-4">
+              <Logs compact />
+            </div>
+          )}
+        </div>
       </SettingsGroup>
 
       {/* Wallpaper Picker Modal */}

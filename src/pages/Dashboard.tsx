@@ -7,7 +7,6 @@ import { Store } from "./Store";
 import { Channels } from "./Channels";
 import { Files } from "./Files";
 import { Tasks } from "./Tasks";
-import { Logs } from "./Logs";
 import { BillingPage } from "./BillingPage";
 import { Settings } from "./Settings";
 import { useAuth } from "../contexts/AuthContext";
@@ -883,8 +882,6 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
         );
       case "tasks":
         return <Tasks gatewayRunning={gatewayRunning} />;
-      case "logs":
-        return <Logs />;
       case "billing":
         return <BillingPage />;
       case "settings":

@@ -1,13 +1,18 @@
 import { useState, useEffect } from "react";
 import { RefreshCw, Trash2 } from "lucide-react";
 
+type LogsProps = {
+  compact?: boolean;
+  className?: string;
+};
+
 type LogEntry = {
   timestamp: string;
   level: "info" | "warn" | "error";
   message: string;
 };
 
-export function Logs() {
+export function Logs({ compact = false, className = "" }: LogsProps) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [autoRefresh, setAutoRefresh] = useState(true);
 
@@ -30,10 +35,10 @@ export function Logs() {
   }
 
   return (
-    <div className="p-6 h-full flex flex-col">
+    <div className={`${compact ? "flex flex-col" : "p-6 h-full flex flex-col"} ${className}`}>
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h1 className="text-xl font-semibold" style={{ color: 'var(--text-primary)' }}>logs</h1>
+          <h1 className={compact ? "text-base font-semibold" : "text-xl font-semibold"} style={{ color: 'var(--text-primary)' }}>logs</h1>
           <p className="text-sm" style={{ color: 'var(--text-tertiary)' }}>gateway activity and events</p>
         </div>
         <div className="flex items-center gap-2">
@@ -84,7 +89,7 @@ export function Logs() {
       </div>
 
       <div 
-        className="flex-1 rounded-xl p-4 font-mono text-sm overflow-auto"
+        className={compact ? "h-64 rounded-xl p-4 font-mono text-sm overflow-auto" : "flex-1 rounded-xl p-4 font-mono text-sm overflow-auto"}
         style={{ 
           background: 'var(--bg-secondary)',
           border: '1px solid var(--glass-border-subtle)'

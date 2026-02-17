@@ -2,7 +2,6 @@ import { ReactNode, useEffect, useState } from "react";
 import {
   MessageSquare,
   Radio,
-  ScrollText,
   Settings,
   FolderOpen,
   CalendarClock,
@@ -37,7 +36,7 @@ function startDrag(e: React.MouseEvent) {
   getCurrentWindow().startDragging();
 }
 
-export type Page = "chat" | "store" | "skills" | "channels" | "files" | "tasks" | "logs" | "settings" | "billing";
+export type Page = "chat" | "store" | "skills" | "channels" | "files" | "tasks" | "settings" | "billing";
 
 type Props = {
   currentPage: Page;
@@ -65,7 +64,6 @@ const baseNavItems: { id: Page; label: string; icon: typeof MessageSquare }[] = 
   { id: "store", label: "Plugins", icon: Puzzle },
   { id: "skills", label: "Skills", icon: Sparkles },
   { id: "tasks", label: "Tasks", icon: CalendarClock },
-  { id: "logs", label: "Logs", icon: ScrollText },
   { id: "billing", label: "Billing", icon: CreditCard },
   { id: "settings", label: "Settings", icon: Settings },
 ];
