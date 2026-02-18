@@ -5,10 +5,10 @@ import { useAuth } from "../contexts/AuthContext";
 import { getUsage, createCheckout, UsageResponse } from "../lib/auth";
 
 const CREDIT_AMOUNTS = [
-  { cents: 500, label: "$5" },
   { cents: 1000, label: "$10" },
   { cents: 2500, label: "$25" },
   { cents: 5000, label: "$50" },
+  { cents: 10000, label: "$100" },
 ];
 const BALANCE_POLL_INTERVAL_MS = 10000;
 const BALANCE_POLL_DURATION_MS = 5 * 60 * 1000;
