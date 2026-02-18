@@ -4751,6 +4751,108 @@ pub async fn stop_runtime(app: AppHandle) -> Result<(), String> {
     runtime.stop_colima().map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn cleanup_app_data(app: AppHandle, include_vms: bool) -> Result<String, String> {
+    use std::fs;
+
+    let runtime = get_runtime(&app);
+    let mut cleanup_log = Vec::<String>::new();
+
+    // Stop runtime first
+    cleanup_log.push("Stopping runtime...".to_string());
+    if let Err(e) = runtime.stop_colima() {
+        cleanup_log.push(format!("Warning: Failed to stop runtime: {}", e));
+    } else {
+        cleanup_log.push("Runtime stopped successfully".to_string());
+    }
+
+    // Clean up Docker resources if requested
+    if include_vms {
+        cleanup_log.push("Cleaning up Docker resources...".to_string());
+
+        let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
+
+        // Try to clean up Docker using shell commands
+        let colima_homes = vec![
+            home_dir.join(".nova").join("colima"),
+            home_dir.join(".nova").join("colima-dev"),
+        ];
+
+        for colima_home in &colima_homes {
+            for profile in &["nova-vz", "nova-qemu"] {
+                let socket = colima_home.join(profile).join("docker.sock");
+                if socket.exists() {
+                    let host = format!("unix://{}", socket.display());
+
+                    // Remove containers
+                    let _ = std::process::Command::new("docker")
+                        .args(&["ps", "-aq"])
+                        .env("DOCKER_HOST", &host)
+                        .output()
+                        .and_then(|out| {
+                            let containers = String::from_utf8_lossy(&out.stdout);
+                            for container_id in containers.lines().filter(|l| !l.trim().is_empty()) {
+                                let _ = std::process::Command::new("docker")
+                                    .args(&["rm", "-f", container_id])
+                                    .env("DOCKER_HOST", &host)
+                                    .output();
+                            }
+                            Ok(())
+                        });
+
+                    // System prune
+                    let _ = std::process::Command::new("docker")
+                        .args(&["system", "prune", "-af", "--volumes"])
+                        .env("DOCKER_HOST", &host)
+                        .output();
+                }
+            }
+        }
+
+        cleanup_log.push("Docker cleanup completed".to_string());
+
+        // Delete Colima VMs
+        cleanup_log.push("Deleting Colima VMs...".to_string());
+        for profile in &["nova-vz", "nova-qemu"] {
+            let _ = std::process::Command::new("colima")
+                .args(&["delete", "-f", "-p", profile])
+                .output();
+        }
+        cleanup_log.push("Colima VMs deleted".to_string());
+
+        // Remove .nova directory (Colima state)
+        let nova_dir = home_dir.join(".nova");
+        if nova_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&nova_dir) {
+                cleanup_log.push(format!("Warning: Failed to remove {}: {}", nova_dir.display(), e));
+            } else {
+                cleanup_log.push(format!("Removed {}", nova_dir.display()));
+            }
+        }
+    }
+
+    // Clear app data (but keep auth.json with user's preferences)
+    cleanup_log.push("Cleaning up app cache...".to_string());
+    if let Some(app_data_dir) = app.path().app_data_dir().ok() {
+        // Remove specific files/dirs but keep auth.json
+        let items_to_remove = vec!["logs", "cache", "tmp"];
+        for item in items_to_remove {
+            let path = app_data_dir.join(item);
+            if path.exists() {
+                let _ = if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+            }
+        }
+        cleanup_log.push("App cache cleared".to_string());
+    }
+
+    cleanup_log.push("Cleanup completed successfully!".to_string());
+    Ok(cleanup_log.join("\n"))
+}
+
 /// Ensure runtime is ready for Docker operations.
 /// On macOS: starts Colima if not running.
 /// On Linux/Windows: checks Docker is available.

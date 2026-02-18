@@ -16,6 +16,8 @@
     "os:default",
     "deep-link:default",
     "updater:default",
-    "stronghold:default"
+    "stronghold:default",
+    "dialog:default",
+    "dialog:allow-ask"
   ]
 }

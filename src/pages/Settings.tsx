@@ -1,7 +1,8 @@
 import { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Store } from "@tauri-apps/plugin-store";
-import { Key, Shield, Sparkles, Cpu, Image, ChevronRight, User, Palette, ChevronDown, ScrollText, LogIn, LogOut, Loader2 } from "lucide-react";
+import { ask } from "@tauri-apps/plugin-dialog";
+import { Key, Shield, Sparkles, Cpu, Image, ChevronRight, User, Palette, ChevronDown, ScrollText, LogIn, LogOut, Loader2, Trash2, AlertTriangle } from "lucide-react";
 import clsx from "clsx";
 import { loadProfile, saveProfile, type AgentProfile } from "../lib/profile";
 import { useAuth } from "../contexts/AuthContext";
@@ -95,6 +96,7 @@ export function Settings({
   onCodeModelChange,
   onImageModelChange,
 }: Props) {
+  console.log("[Settings] Component rendering");
   const { isAuthenticated, isAuthConfigured } = useAuth();
   const proxyEnabled = isAuthConfigured && isAuthenticated && !useLocalKeys;
   const [apiKeys, setApiKeys] = useState({ anthropic: "", openai: "", google: "" });
@@ -114,6 +116,7 @@ export function Settings({
   // Anthropic OAuth code-paste state
   const [anthropicCodePending, setAnthropicCodePending] = useState(false);
   const [anthropicCodeInput, setAnthropicCodeInput] = useState("");
+  const [cleanupLoading, setCleanupLoading] = useState(false);
 
   // Wallpaper state
   const [wallpaperId, setWallpaperId] = useState(DEFAULT_WALLPAPER_ID);
@@ -688,6 +691,122 @@ export function Settings({
               <Logs compact />
             </div>
           )}
+        </div>
+      </SettingsGroup>
+
+      <SettingsGroup title="Data Management">
+        <div className="p-4 space-y-4">
+          <div className="flex items-start gap-3">
+            <div className="w-7 h-7 rounded-md bg-red-50 text-red-600 flex items-center justify-center flex-shrink-0">
+              <Trash2 className="w-4 h-4" />
+            </div>
+            <div className="flex-1">
+              <div className="text-[14px] font-medium text-[var(--text-primary)] mb-1">Reset Application</div>
+              <div className="text-[12px] text-[var(--text-secondary)] mb-3">
+                Clean up Colima VMs, Docker containers, volumes, and app cache. Your auth settings will be preserved.
+              </div>
+              <button
+                onClick={async () => {
+                  console.log("[Settings] Reset Application clicked");
+                  const confirmed = await ask("Are you sure you want to reset the application?", {
+                    title: "Reset Application",
+                    kind: "warning",
+                    okLabel: "Reset",
+                    cancelLabel: "Cancel"
+                  });
+                  console.log("[Settings] Confirmation result:", confirmed);
+                  if (!confirmed) {
+                    console.log("[Settings] Reset cancelled by user");
+                    return;
+                  }
+
+                  setCleanupLoading(true);
+                  console.log("[Settings] Starting cleanup...");
+                  try {
+                    const result = await invoke<string>("cleanup_app_data", { includeVms: true });
+                    console.log("[Settings] Cleanup succeeded:", result);
+                    alert("Cleanup completed!\n\n" + result);
+                  } catch (err) {
+                    console.error("[Settings] Cleanup failed:", err);
+                    alert("Cleanup failed: " + (err instanceof Error ? err.message : String(err)));
+                  } finally {
+                    setCleanupLoading(false);
+                    console.log("[Settings] Cleanup finished");
+                  }
+                }}
+                disabled={cleanupLoading}
+                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+              >
+                {cleanupLoading && <Loader2 className="w-4 h-4 animate-spin" />}
+                {cleanupLoading ? "Cleaning up..." : "Reset Application"}
+              </button>
+            </div>
+          </div>
+
+          <div className="border-t border-[var(--border-subtle)] pt-4">
+            <div className="flex items-start gap-3">
+              <div className="w-7 h-7 rounded-md bg-gray-100 text-gray-600 flex items-center justify-center flex-shrink-0">
+                <LogOut className="w-4 h-4" />
+              </div>
+              <div className="flex-1">
+                <div className="text-[14px] font-medium text-[var(--text-primary)] mb-1">Uninstall Nova</div>
+                <div className="text-[12px] text-[var(--text-secondary)] mb-3">
+                  Clean up all data and quit the app. After this, you can move Nova to trash.
+                </div>
+                <div className="flex items-center gap-2 p-3 bg-blue-50 border border-blue-200 rounded-lg mb-3">
+                  <AlertTriangle className="w-4 h-4 text-blue-600 flex-shrink-0" />
+                  <p className="text-xs text-blue-800">
+                    This will delete everything including your settings. Use "Reset Application" instead if you plan to reinstall.
+                  </p>
+                </div>
+                <button
+                  onClick={async () => {
+                    console.log("[Settings] Cleanup and Quit clicked");
+                    const confirmed = await ask("Are you sure you want to completely uninstall Nova?\n\nThis will delete all data including settings and quit the app. You can then move Nova.app to trash.\n\nThis action cannot be undone.", {
+                      title: "Uninstall Nova",
+                      kind: "warning",
+                      okLabel: "Uninstall",
+                      cancelLabel: "Cancel"
+                    });
+                    console.log("[Settings] Confirmation result:", confirmed);
+                    if (!confirmed) {
+                      console.log("[Settings] Uninstall cancelled by user");
+                      return;
+                    }
+
+                    setCleanupLoading(true);
+                    console.log("[Settings] Starting uninstall cleanup...");
+                    try {
+                      const result = await invoke<string>("cleanup_app_data", { includeVms: true });
+                      console.log("[Settings] Cleanup succeeded:", result);
+
+                      // Also clear auth settings for complete uninstall
+                      console.log("[Settings] Clearing auth settings...");
+                      const store = await Store.load("auth.json");
+                      await store.clear();
+                      await store.save();
+
+                      alert("Uninstall cleanup completed!\n\n" + result + "\n\nThe app will now quit. You can move Nova to trash.");
+
+                      // Quit the app
+                      console.log("[Settings] Quitting app...");
+                      const { exit } = await import("@tauri-apps/plugin-process");
+                      await exit(0);
+                    } catch (err) {
+                      console.error("[Settings] Cleanup failed:", err);
+                      alert("Cleanup failed: " + (err instanceof Error ? err.message : String(err)));
+                      setCleanupLoading(false);
+                    }
+                  }}
+                  disabled={cleanupLoading}
+                  className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white text-sm font-medium rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                >
+                  {cleanupLoading && <Loader2 className="w-4 h-4 animate-spin" />}
+                  {cleanupLoading ? "Cleaning up..." : "Cleanup and Quit"}
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       </SettingsGroup>
 

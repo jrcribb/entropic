@@ -942,6 +942,7 @@ export function Chat({
   const [lastChatEvent, setLastChatEvent] = useState<ChatEvent | null>(null);
   const [lastSendId, setLastSendId] = useState<string | null>(null);
   const [lastSendAt, setLastSendAt] = useState<number | null>(null);
+  const [componentMountedAt] = useState(Date.now());
   const runTimingsRef = useRef<Record<string, {
     startedAt: number;
     ackAt?: number;
@@ -1594,7 +1595,9 @@ export function Chat({
       const onAgent = (event: AgentEvent) => handleAgentEvent(event);
       const onError = (err: string) => {
         const normalizedError = sanitizeGatewayErrorMessage(err);
-        const suppressError = gatewayStarting || isConnecting || !gatewayRunning;
+        // Suppress errors during startup grace period (first 15 seconds after component mount)
+        const inStartupGracePeriod = Date.now() - componentMountedAt < 15_000;
+        const suppressError = gatewayStarting || isConnecting || !gatewayRunning || inStartupGracePeriod;
         if (!client.isConnected()) {
           setConnected(false);
         }
@@ -1608,7 +1611,7 @@ export function Chat({
           clearActiveRunTracking();
         }
         setLastGatewayError(normalizedError);
-        addDiag(`gateway error: ${normalizedError}`);
+        addDiag(`gateway error: ${normalizedError}${inStartupGracePeriod ? ' (suppressed: startup grace period)' : ''}`);
       };
       client.on("connected", onConnected);
       client.on("disconnected", onDisconnected);
@@ -1622,11 +1625,12 @@ export function Chat({
         await client.connect();
       }
     } catch (e) {
-      if (!gatewayStarting) {
+      const inStartupGracePeriod = Date.now() - componentMountedAt < 15_000;
+      if (!gatewayStarting && !inStartupGracePeriod) {
         setError(e instanceof Error ? e.message : "Connection failed");
       }
       setIsConnecting(false);
-      addDiag(`connect failed: ${e instanceof Error ? e.message : "unknown"}`);
+      addDiag(`connect failed: ${e instanceof Error ? e.message : "unknown"}${inStartupGracePeriod ? ' (suppressed: startup grace period)' : ''}`);
     } finally {
       connectInFlightRef.current = false;
     }
