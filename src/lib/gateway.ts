@@ -321,7 +321,12 @@ export class GatewayClient {
       }
 
       const frame: RequestFrame = { type: "req", id, method, params };
-      const timeoutMs = 20_000;
+      const timeoutMs =
+        method === "chat.send"
+          ? 60_000
+          : method === "chat.history" || method === "sessions.list"
+            ? 45_000
+            : 20_000;
       const timeoutHandle = setTimeout(() => {
         const pending = this.pendingRequests.get(id);
         if (pending) {

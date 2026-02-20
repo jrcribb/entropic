@@ -38,6 +38,7 @@ const ENTROPIC_PROXY_ALLOWED_HOSTS: &[&str] = &[
 ];
 const MAX_BRIDGE_DEVICES: usize = 10;
 const CLIENT_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const CLIENT_LOG_READ_MAX_BYTES: usize = 512 * 1024;
 
 fn client_log_path() -> PathBuf {
     dirs::home_dir()
@@ -65,6 +66,39 @@ fn append_client_log_line(message: &str) -> Result<(), String> {
     writeln!(file, "[{}] [client] {}", ts, message)
         .map_err(|e| format!("Failed to write client log: {}", e))?;
     Ok(())
+}
+
+fn read_client_log_text(max_bytes: Option<usize>) -> Result<String, String> {
+    let path = client_log_path();
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let bytes = fs::read(&path).map_err(|e| format!("Failed to read client log: {}", e))?;
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+
+    let requested_max = max_bytes.unwrap_or(CLIENT_LOG_READ_MAX_BYTES);
+    let safe_max = requested_max.max(1024);
+    let clipped = if bytes.len() > safe_max {
+        &bytes[bytes.len() - safe_max..]
+    } else {
+        &bytes[..]
+    };
+
+    Ok(String::from_utf8_lossy(clipped).to_string())
+}
+
+fn default_client_log_export_path() -> Result<PathBuf, String> {
+    let base_dir = dirs::download_dir()
+        .or_else(dirs::desktop_dir)
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "Could not resolve a directory to export logs".to_string())?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(base_dir.join(format!("entropic-runtime-{}.log", ts)))
 }
 
 /// Get the Docker socket path for the current platform.
@@ -6504,6 +6538,26 @@ pub async fn append_client_log(message: String) -> Result<(), String> {
     }
 
     append_client_log_line(&clipped)
+}
+
+#[tauri::command]
+pub async fn read_client_log(max_bytes: Option<usize>) -> Result<String, String> {
+    read_client_log_text(max_bytes)
+}
+
+#[tauri::command]
+pub async fn clear_client_log() -> Result<(), String> {
+    let path = client_log_path();
+    fs::write(path, "").map_err(|e| format!("Failed to clear client log: {}", e))
+}
+
+#[tauri::command]
+pub async fn export_client_log() -> Result<String, String> {
+    let log_text = read_client_log_text(None)?;
+    let export_path = default_client_log_export_path()?;
+    fs::write(&export_path, log_text)
+        .map_err(|e| format!("Failed to export client log to {}: {}", export_path.display(), e))?;
+    Ok(export_path.display().to_string())
 }
 
 #[tauri::command]

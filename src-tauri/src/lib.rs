@@ -127,6 +127,9 @@ pub fn run() {
             commands::check_runtime_status,
             commands::get_runtime_version_info,
             commands::append_client_log,
+            commands::read_client_log,
+            commands::clear_client_log,
+            commands::export_client_log,
             commands::start_runtime,
             commands::stop_runtime,
             commands::cleanup_app_data,
@@ -225,6 +228,14 @@ pub fn run() {
                 {
                     println!("[Entropic] Window close requested — preserving containers...");
                     commands::cleanup_on_exit();
+                }
+            }
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
                 }
             }
             RunEvent::Exit => {

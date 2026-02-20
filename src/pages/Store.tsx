@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ComponentType } from "react"
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import clsx from "clsx";
-import { CheckCircle2, Loader2, Search, ShieldCheck, Download, Star, ExternalLink, Box, Puzzle, Sparkles, ChevronRight, Info } from "lucide-react";
+import { CheckCircle2, Loader2, Search, ShieldCheck, Download, Star, ExternalLink, Box, Puzzle, Sparkles, ChevronRight, Info, X } from "lucide-react";
 import {
   getIntegrations,
   getIntegrationsCached,
@@ -306,7 +306,8 @@ export function Store({
   const [clawhubCatalog, setClawhubCatalog] = useState<ClawhubCatalogSkill[]>([]);
   const [clawhubLoading, setClawhubLoading] = useState(false);
   const [clawhubLookupError, setClawhubLookupError] = useState<string | null>(null);
-  const [expandedClawhubSlug, setExpandedClawhubSlug] = useState<string | null>(null);
+  const [clawhubDetailModalSlug, setClawhubDetailModalSlug] = useState<string | null>(null);
+  const [clawhubDetailModalSkill, setClawhubDetailModalSkill] = useState<ClawhubCatalogSkill | null>(null);
   const [clawhubDetails, setClawhubDetails] = useState<Record<string, ClawhubSkillDetails>>({});
   const [clawhubDetailLoading, setClawhubDetailLoading] = useState<string | null>(null);
   const [clawhubDetailError, setClawhubDetailError] = useState<string | null>(null);
@@ -658,7 +659,7 @@ export function Store({
     }
   }
 
-  async function scanInstallSkillFromClawhub(slug: string, allowUnsafe: boolean) {
+  async function scanInstallSkillFromClawhub(slug: string, allowUnsafe: boolean, targetName?: string) {
     const normalizedSlug = slug.trim();
     if (!normalizedSlug) return;
 
@@ -673,7 +674,7 @@ export function Store({
         allowUnsafe,
       });
       setScanIntent("skill-audit");
-      setScanTargetName(normalizedSlug);
+      setScanTargetName((targetName || normalizedSlug).trim() || normalizedSlug);
       setScanPluginId(null);
       setScanResult(result.scan);
       setScanError(null);
@@ -725,13 +726,10 @@ export function Store({
     }
   }
 
-  async function toggleClawhubDetails(slug: string) {
-    if (expandedClawhubSlug === slug) {
-      setExpandedClawhubSlug(null);
-      setClawhubDetailError(null);
-      return;
-    }
-    setExpandedClawhubSlug(slug);
+  async function openClawhubDetails(skill: ClawhubCatalogSkill) {
+    const slug = skill.slug;
+    setClawhubDetailModalSlug(slug);
+    setClawhubDetailModalSkill(skill);
     setClawhubDetailError(null);
 
     if (clawhubDetails[slug]) {
@@ -749,6 +747,12 @@ export function Store({
     } finally {
       setClawhubDetailLoading(null);
     }
+  }
+
+  function closeClawhubDetailsModal() {
+    setClawhubDetailModalSlug(null);
+    setClawhubDetailModalSkill(null);
+    setClawhubDetailError(null);
   }
 
   const pluginsSansEntropicX = useMemo(() => plugins.filter((p) => p.id !== ENTROPIC_X_SKILL_ID), [plugins]);
@@ -837,11 +841,15 @@ export function Store({
   );
 
   const isRateLimited = clawhubCatalog.some((s) => s.is_fallback);
+  const activeClawhubSkill = clawhubDetailModalSlug
+    ? clawhubCatalog.find((skill) => skill.slug === clawhubDetailModalSlug) ?? clawhubDetailModalSkill
+    : clawhubDetailModalSkill;
+  const activeClawhubDetails = clawhubDetailModalSlug ? clawhubDetails[clawhubDetailModalSlug] : null;
+  const activeClawhubInstalled = clawhubDetailModalSlug ? installedWorkspaceSkillIds.has(clawhubDetailModalSlug) : false;
+  const activeClawhubBusy = !!(clawhubDetailModalSlug && clawhubBusy && clawhubBusySlug === clawhubDetailModalSlug);
 
   function renderClawhubSkillCard(skill: ClawhubCatalogSkill) {
     const installed = installedWorkspaceSkillIds.has(skill.slug);
-    const expanded = expandedClawhubSlug === skill.slug;
-    const details = clawhubDetails[skill.slug];
 
     return (
       <div key={skill.slug} className="group bg-white rounded-xl p-4 shadow-sm border border-[var(--border-subtle)] hover:shadow-md transition-all duration-300 flex flex-col h-full">
@@ -864,7 +872,7 @@ export function Store({
           </div>
           <div className="flex flex-col items-end gap-2">
             <button
-              onClick={() => scanInstallSkillFromClawhub(skill.slug, false)}
+              onClick={() => scanInstallSkillFromClawhub(skill.slug, false, skill.display_name || skill.slug)}
               disabled={clawhubBusy || installed}
               className={clsx(
                 "px-4 py-1.5 rounded-full text-[11px] font-semibold transition-all uppercase tracking-wide",
@@ -891,41 +899,12 @@ export function Store({
         </div>
 
         <button
-          onClick={() => toggleClawhubDetails(skill.slug)}
+          onClick={() => { void openClawhubDetails(skill); }}
           className="w-full py-2 rounded-lg text-xs font-semibold text-[var(--text-secondary)] bg-[var(--system-gray-6)] border border-[var(--border-subtle)] hover:bg-[var(--system-gray-5)] hover:text-[var(--text-primary)] transition-colors flex items-center justify-center gap-2"
         >
-          {expanded ? "Hide Details" : "Learn More"}
-          <ChevronRight className={clsx("w-3.5 h-3.5 transition-transform", expanded && "rotate-90")} />
+          View Details
+          <ChevronRight className="w-3.5 h-3.5" />
         </button>
-
-        {expanded && (
-          <div className="mt-4 pt-4 border-t border-[var(--border-subtle)] animate-in fade-in slide-in-from-top-2 duration-300">
-            {clawhubDetailLoading === skill.slug ? (
-              <div className="flex items-center justify-center py-4">
-                <Loader2 className="w-5 h-5 animate-spin text-[var(--text-tertiary)]" />
-              </div>
-            ) : clawhubDetailError ? (
-              <p className="text-xs text-red-500 text-center">{clawhubDetailError}</p>
-            ) : details ? (
-              <div className="space-y-3 text-xs text-[var(--text-secondary)]">
-                <div className="flex justify-between">
-                  <span className="font-medium">Developer</span>
-                  <span className="text-[var(--text-primary)]">{details.owner_display_name || details.owner_handle || "OpenClaw"}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="font-medium">Total Installs</span>
-                  <span className="text-[var(--text-primary)]">{formatCompactNumber(details.installs_all_time)}</span>
-                </div>
-                {details.changelog && (
-                  <div className="bg-[var(--system-gray-6)] rounded-lg p-3 border border-[var(--border-subtle)]">
-                    <p className="font-semibold text-[10px] uppercase tracking-wide mb-1 text-[var(--text-tertiary)]">What's New</p>
-                    <p className="line-clamp-4 leading-relaxed">{details.changelog}</p>
-                  </div>
-                )}
-              </div>
-            ) : null}
-          </div>
-        )}
       </div>
     );
   }
@@ -1196,12 +1175,153 @@ export function Store({
           scanIntent === "plugin-enable"
             ? confirmEnablePlugin
             : pendingUnsafeSlug
-              ? () => { void scanInstallSkillFromClawhub(pendingUnsafeSlug, true); }
+              ? () => {
+                  const pendingSkillName = clawhubCatalog.find((skill) => skill.slug === pendingUnsafeSlug)?.display_name || pendingUnsafeSlug;
+                  void scanInstallSkillFromClawhub(pendingUnsafeSlug, true, pendingSkillName);
+                }
               : undefined
         }
         confirmLabel={scanIntent === "plugin-enable" ? "Enable Plugin" : "Install Skill"}
         confirmAnywayLabel={scanIntent === "plugin-enable" ? "Enable Anyway" : "Install Anyway"}
       />
+
+      {clawhubDetailModalSlug && (
+        <div
+          className="fixed inset-0 z-50 bg-black/30 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={closeClawhubDetailsModal}
+        >
+          <div
+            className="w-full max-w-4xl max-h-[88vh] overflow-y-auto rounded-2xl border border-[var(--border-subtle)] bg-white shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="sticky top-0 z-10 bg-white/95 backdrop-blur border-b border-[var(--border-subtle)] px-6 py-4 flex items-start justify-between gap-4">
+              <div className="min-w-0">
+                <p className="text-xs uppercase tracking-wide font-semibold text-[var(--text-tertiary)] mb-1">ClawHub Skill</p>
+                <h2 className="text-xl font-semibold text-[var(--text-primary)] truncate">
+                  {activeClawhubSkill?.display_name || clawhubDetailModalSlug}
+                </h2>
+                <div className="flex items-center gap-2 mt-1 text-xs text-[var(--text-tertiary)]">
+                  <span className="font-medium">Slug:</span>
+                  <span>{clawhubDetailModalSlug}</span>
+                  <span>•</span>
+                  <span>v{activeClawhubDetails?.latest_version || activeClawhubSkill?.latest_version || "1.0"}</span>
+                </div>
+              </div>
+              <button
+                onClick={closeClawhubDetailsModal}
+                className="p-2 rounded-lg text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--system-gray-6)]"
+                aria-label="Close details"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="px-6 py-5 space-y-5">
+              {clawhubDetailLoading === clawhubDetailModalSlug ? (
+                <div className="py-16 flex flex-col items-center gap-3">
+                  <Loader2 className="w-7 h-7 animate-spin text-[var(--system-blue)]" />
+                  <p className="text-sm text-[var(--text-secondary)]">Loading skill details...</p>
+                </div>
+              ) : (
+                <>
+                  <p className="text-sm leading-relaxed text-[var(--text-secondary)]">
+                    {activeClawhubDetails?.summary || activeClawhubSkill?.summary || "No summary available for this skill."}
+                  </p>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] p-3">
+                      <p className="text-[11px] uppercase font-semibold tracking-wide text-[var(--text-tertiary)] mb-1">Developer</p>
+                      <p className="text-sm text-[var(--text-primary)]">
+                        {activeClawhubDetails?.owner_display_name || activeClawhubDetails?.owner_handle || "OpenClaw"}
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] p-3">
+                      <p className="text-[11px] uppercase font-semibold tracking-wide text-[var(--text-tertiary)] mb-1">Stars</p>
+                      <p className="text-sm text-[var(--text-primary)] flex items-center gap-1.5">
+                        <Star className="w-3.5 h-3.5 text-amber-500 fill-current" />
+                        {formatCompactNumber(activeClawhubDetails?.stars ?? activeClawhubSkill?.stars ?? 0)}
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] p-3">
+                      <p className="text-[11px] uppercase font-semibold tracking-wide text-[var(--text-tertiary)] mb-1">Downloads</p>
+                      <p className="text-sm text-[var(--text-primary)] flex items-center gap-1.5">
+                        <Download className="w-3.5 h-3.5 text-[var(--text-tertiary)]" />
+                        {formatCompactNumber(activeClawhubDetails?.downloads ?? activeClawhubSkill?.downloads ?? 0)}
+                      </p>
+                    </div>
+                    <div className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-secondary)] p-3">
+                      <p className="text-[11px] uppercase font-semibold tracking-wide text-[var(--text-tertiary)] mb-1">Total Installs</p>
+                      <p className="text-sm text-[var(--text-primary)]">
+                        {formatCompactNumber(activeClawhubDetails?.installs_all_time ?? activeClawhubSkill?.installs_all_time ?? 0)}
+                      </p>
+                    </div>
+                  </div>
+
+                  {clawhubDetailError && (
+                    <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 text-sm text-red-700">
+                      {clawhubDetailError}
+                    </div>
+                  )}
+
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--system-gray-6)]/40 p-4">
+                    <div className="flex items-center justify-between gap-3 mb-2">
+                      <p className="text-[11px] uppercase font-semibold tracking-wide text-[var(--text-tertiary)]">What&apos;s New</p>
+                      <a
+                        href={`https://clawhub.org/skills/${clawhubDetailModalSlug}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 text-xs font-semibold text-[var(--system-blue)] hover:underline"
+                      >
+                        Open on ClawHub
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    </div>
+                    <p className="text-sm leading-relaxed whitespace-pre-wrap text-[var(--text-secondary)]">
+                      {activeClawhubDetails?.changelog || "No changelog provided for this version."}
+                    </p>
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="sticky bottom-0 z-10 border-t border-[var(--border-subtle)] bg-white/95 backdrop-blur px-6 py-4 flex items-center justify-end gap-3">
+              <button
+                onClick={closeClawhubDetailsModal}
+                className="btn btn-secondary"
+              >
+                Close
+              </button>
+              <button
+                onClick={() => {
+                  if (!activeClawhubSkill) return;
+                  closeClawhubDetailsModal();
+                  void scanInstallSkillFromClawhub(
+                    activeClawhubSkill.slug,
+                    false,
+                    activeClawhubSkill.display_name || activeClawhubSkill.slug,
+                  );
+                }}
+                disabled={activeClawhubInstalled || activeClawhubBusy || !activeClawhubSkill}
+                className={clsx(
+                  "btn btn-primary inline-flex items-center gap-2",
+                  activeClawhubInstalled && "opacity-70 cursor-default"
+                )}
+              >
+                {activeClawhubBusy ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Installing...
+                  </>
+                ) : activeClawhubInstalled ? (
+                  "Installed"
+                ) : (
+                  "Scan + Install"
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {setupProvider && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-gray-900/40 backdrop-blur-sm">

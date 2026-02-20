@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { X, Loader2, ShieldCheck, ShieldAlert, AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { X, Loader2, ShieldCheck, ShieldAlert, AlertTriangle, ChevronDown, ChevronRight, CheckCircle2, Circle } from "lucide-react";
 import clsx from "clsx";
 
 type ScanFinding = {
@@ -49,12 +49,58 @@ export function ScanResultModal({
   onClose, onConfirm, confirmLabel = "Enable Plugin", confirmAnywayLabel = "Enable Anyway",
 }: Props) {
   const [expandedFindings, setExpandedFindings] = useState<Set<number>>(new Set());
-
-  if (!isOpen) return null;
+  const [scanElapsedSeconds, setScanElapsedSeconds] = useState(0);
 
   const isBlocked = scanResult && !scanResult.is_safe &&
     ["CRITICAL", "HIGH"].includes(scanResult.max_severity);
   const scannerUnavailable = !!scanResult && !scanResult.scanner_available;
+  const scanPassed = !!scanResult && scanResult.is_safe;
+
+  useEffect(() => {
+    if (!isOpen) {
+      setScanElapsedSeconds(0);
+      return;
+    }
+    if (!isScanning) {
+      return;
+    }
+    setScanElapsedSeconds(0);
+    const timer = window.setInterval(() => {
+      setScanElapsedSeconds((prev) => prev + 1);
+    }, 1000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isOpen, isScanning]);
+
+  const scanStages = useMemo(
+    () => [
+      {
+        title: "Prepare isolated scanner runtime",
+        detail: "Starting scanner dependencies and workspace sandbox",
+        completeAfterSeconds: 2,
+      },
+      {
+        title: `Inspect ${targetType} files and manifest`,
+        detail: "Collecting package metadata and behavior signals",
+        completeAfterSeconds: 6,
+      },
+      {
+        title: "Run static + behavioral checks",
+        detail: "Evaluating permissions, network usage, and execution patterns",
+        completeAfterSeconds: 12,
+      },
+      {
+        title: "Generate security report",
+        detail: "Scoring findings and preparing final recommendation",
+        completeAfterSeconds: 18,
+      },
+    ],
+    [targetType]
+  );
+  const scanProgress = Math.min(100, Math.max(8, Math.round((scanElapsedSeconds / 18) * 100)));
+
+  if (!isOpen) return null;
 
   function toggleFinding(idx: number) {
     const next = new Set(expandedFindings);
@@ -80,10 +126,67 @@ export function ScanResultModal({
 
         {/* Scanning state */}
         {isScanning && (
-          <div className="py-12 text-center">
-            <Loader2 className="w-8 h-8 animate-spin mx-auto mb-3 text-[var(--text-accent)]" />
-            <p className="text-[var(--text-secondary)]">Scanning {targetType} for security issues...</p>
-            <p className="text-xs text-[var(--text-tertiary)] mt-1">Static + behavioral analysis</p>
+          <div className="py-3">
+            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-secondary)] p-4 mb-4">
+              <div className="flex items-start gap-3 mb-3">
+                <div className="w-9 h-9 rounded-full bg-[var(--system-blue)]/10 flex items-center justify-center shrink-0 mt-0.5">
+                  <Loader2 className="w-5 h-5 animate-spin text-[var(--system-blue)]" />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold text-[var(--text-primary)]">
+                    Scanning {targetType}: {targetName}
+                  </p>
+                  <p className="text-xs text-[var(--text-secondary)] mt-1">
+                    Running Cisco scanner checks in an isolated runtime.
+                  </p>
+                </div>
+              </div>
+              <div className="w-full h-2 rounded-full bg-[var(--system-gray-6)] overflow-hidden">
+                <div
+                  className="h-full bg-[var(--system-blue)] transition-all duration-500 ease-out"
+                  style={{ width: `${scanProgress}%` }}
+                />
+              </div>
+              <p className="text-[11px] text-[var(--text-tertiary)] mt-2">
+                Usually takes 10-25s. Elapsed: {scanElapsedSeconds}s
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              {scanStages.map((stage, idx) => {
+                const complete = scanElapsedSeconds >= stage.completeAfterSeconds;
+                const previousComplete = idx === 0 ? true : scanElapsedSeconds >= scanStages[idx - 1].completeAfterSeconds;
+                const active = !complete && previousComplete;
+
+                return (
+                  <div
+                    key={stage.title}
+                    className={clsx(
+                      "rounded-lg border px-3 py-2.5 flex items-start gap-2.5 transition-colors",
+                      complete
+                        ? "border-green-100 bg-green-50"
+                        : active
+                          ? "border-blue-100 bg-blue-50"
+                          : "border-[var(--border-subtle)] bg-white"
+                    )}
+                  >
+                    <div className="mt-0.5">
+                      {complete ? (
+                        <CheckCircle2 className="w-4 h-4 text-green-600" />
+                      ) : active ? (
+                        <Loader2 className="w-4 h-4 text-blue-600 animate-spin" />
+                      ) : (
+                        <Circle className="w-4 h-4 text-[var(--text-tertiary)]" />
+                      )}
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-[var(--text-primary)]">{stage.title}</p>
+                      <p className="text-xs text-[var(--text-secondary)] mt-0.5">{stage.detail}</p>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
         )}
 
@@ -173,7 +276,9 @@ export function ScanResultModal({
 
             {/* Action buttons */}
             <div className="flex gap-3 justify-end">
-              <button onClick={onClose} className="btn btn-secondary">Cancel</button>
+              {!scanPassed && (
+                <button onClick={onClose} className="btn btn-secondary">Cancel</button>
+              )}
               {onConfirm && (scanResult.is_safe || !scanResult.scanner_available) && (
                 <button onClick={onConfirm} className="btn btn-primary">{confirmLabel}</button>
               )}
@@ -187,6 +292,9 @@ export function ScanResultModal({
                 <button onClick={onConfirm} className="btn btn-primary">
                   {confirmLabel}
                 </button>
+              )}
+              {!onConfirm && scanPassed && (
+                <button onClick={onClose} className="btn btn-primary">Done</button>
               )}
             </div>
           </>

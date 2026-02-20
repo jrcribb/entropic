@@ -2,7 +2,7 @@ import { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Store } from "@tauri-apps/plugin-store";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { Key, Shield, Sparkles, Cpu, Image, ChevronRight, User, Palette, ChevronDown, ScrollText, LogIn, LogOut, Loader2, Trash2, AlertTriangle } from "lucide-react";
+import { Key, Shield, Sparkles, Cpu, Image, ChevronRight, User, Palette, ChevronDown, ScrollText, LogIn, LogOut, Loader2, Trash2, AlertTriangle, Copy, Download } from "lucide-react";
 import clsx from "clsx";
 import { loadProfile, saveProfile, type AgentProfile } from "../lib/profile";
 import { useAuth } from "../contexts/AuthContext";
@@ -419,6 +419,53 @@ export function Settings({
   function handleClearGatewayDiagnostics() {
     clearDiagnosticLogs();
     setGatewayDiagLogs([]);
+  }
+
+  function formatGatewayDiagnostics(entries: DiagnosticLogEntry[]): string {
+    return entries
+      .map((entry) => `[${new Date(entry.ts).toISOString()}] [${entry.type.toUpperCase()}] ${entry.message}`)
+      .join("\n");
+  }
+
+  async function copyGatewayDiagnostics(entries: DiagnosticLogEntry[]) {
+    const payload = formatGatewayDiagnostics(entries);
+    if (!payload.trim()) return;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(payload);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = payload;
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textarea);
+      }
+      alert("Diagnostics copied.");
+    } catch (error) {
+      console.error("[Entropic] Failed to copy diagnostics:", error);
+      alert("Failed to copy diagnostics.");
+    }
+  }
+
+  function exportGatewayDiagnostics(entries: DiagnosticLogEntry[]) {
+    const payload = formatGatewayDiagnostics(entries);
+    if (!payload.trim()) return;
+    try {
+      const blob = new Blob([payload], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      a.href = url;
+      a.download = `entropic-diagnostics-${ts}.log`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error("[Entropic] Failed to export diagnostics:", error);
+      alert("Failed to export diagnostics.");
+    }
   }
 
   return (
@@ -932,6 +979,22 @@ export function Settings({
                   className="px-2 py-1 text-xs rounded-md border border-[var(--border-subtle)] text-[var(--text-secondary)] hover:bg-[var(--system-gray-6)]"
                 >
                   Refresh
+                </button>
+                <button
+                  onClick={() => void copyGatewayDiagnostics(filteredGatewayDiagLogs)}
+                  disabled={filteredGatewayDiagLogs.length === 0}
+                  className="px-2 py-1 text-xs rounded-md border border-[var(--border-subtle)] text-[var(--text-secondary)] hover:bg-[var(--system-gray-6)] disabled:opacity-50 flex items-center gap-1"
+                >
+                  <Copy className="w-3 h-3" />
+                  Copy
+                </button>
+                <button
+                  onClick={() => exportGatewayDiagnostics(filteredGatewayDiagLogs)}
+                  disabled={filteredGatewayDiagLogs.length === 0}
+                  className="px-2 py-1 text-xs rounded-md border border-[var(--border-subtle)] text-[var(--text-secondary)] hover:bg-[var(--system-gray-6)] disabled:opacity-50 flex items-center gap-1"
+                >
+                  <Download className="w-3 h-3" />
+                  Export
                 </button>
                 <button
                   onClick={handleClearGatewayDiagnostics}

@@ -536,10 +536,30 @@ function stripInlineClawdbotMetadata(raw: string): string {
   return result;
 }
 
+const OPENCLAW_STATUS_LINE_PATTERNS: RegExp[] = [
+  /^\s*🦞\s*OpenClaw\b.*$/i,
+  /^\s*🕒\s*Time:\s*.*$/i,
+  /^\s*🧠\s*Model:\s*.*$/i,
+  /^\s*📚\s*Context:\s*.*$/i,
+  /^\s*🧹\s*Compactions:\s*.*$/i,
+  /^\s*🧵\s*Session:\s*.*$/i,
+  /^\s*⚙️?\s*Runtime:\s*.*$/i,
+  /^\s*🪢\s*Queue:\s*.*$/i,
+];
+
+function stripOpenClawStatusLines(raw: string): string {
+  if (!raw) return "";
+  return raw
+    .split(/\r?\n/)
+    .filter((line) => !OPENCLAW_STATUS_LINE_PATTERNS.some((pattern) => pattern.test(line.trim())))
+    .join("\n");
+}
+
 function sanitizeAssistantDisplayContent(raw: string): string {
   if (!raw) return "";
   let text = stripConversationMetadata(raw);
   text = stripExternalUntrustedSections(text);
+  text = stripOpenClawStatusLines(text);
 
   try {
     const direct = JSON.parse(text);
@@ -747,8 +767,59 @@ function extractMessageText(message: GatewayMessage): { text: string; hasText: b
   return { text: "", hasText: false, hasNonText: false };
 }
 
+function isChannelOrSystemSessionKey(rawKey: string | null | undefined): boolean {
+  const key = (rawKey || "").trim().toLowerCase();
+  if (!key) return true;
+  if (key.startsWith("agent:") || key.startsWith("cron:") || key.startsWith("system:")) {
+    return true;
+  }
+  return CHANNEL_SESSION_KEY_MARKERS.some(
+    (marker) => key.startsWith(`${marker}:`) || key.includes(`:${marker}:`),
+  );
+}
+
+function shouldDisplayGatewaySession(rawKey: string | null | undefined): boolean {
+  const key = (rawKey || "").trim();
+  if (!key) return false;
+  if (UI_SESSION_KEY_RE.test(key)) return true;
+  return !isChannelOrSystemSessionKey(key);
+}
+
+function isChannelOriginGatewayMessage(message: GatewayMessage): boolean {
+  const channelKeys = ["channel", "provider", "surface", "originatingChannel"] as const;
+  for (const key of channelKeys) {
+    const raw = message?.[key];
+    if (typeof raw !== "string") continue;
+    const normalized = raw.trim().toLowerCase();
+    if (!normalized) continue;
+    if (CHANNEL_SESSION_KEY_MARKERS.includes(normalized)) {
+      return true;
+    }
+  }
+  const sessionKey =
+    typeof message?.sessionKey === "string"
+      ? message.sessionKey
+      : typeof message?.session_id === "string"
+        ? message.session_id
+        : "";
+  if (!sessionKey) return false;
+  return isChannelOrSystemSessionKey(sessionKey);
+}
+
+function normalizeGatewayMarker(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
 function normalizeGatewayMessage(message: GatewayMessage, id: string): Message | null {
+  if (isChannelOriginGatewayMessage(message)) {
+    return null;
+  }
   const roleRaw = typeof message?.role === "string" ? message.role.toLowerCase() : "assistant";
+  const providerTag = normalizeGatewayMarker(message?.provider);
+  const modelTag = normalizeGatewayMarker(message?.model);
+  if (providerTag === "openclaw" || modelTag === "gateway-injected") {
+    return null;
+  }
   const { text, hasText, hasNonText } = extractMessageText(message);
   const messageTimestamp = extractMessageTimestamp(message);
   if (roleRaw === "user") {
@@ -783,20 +854,7 @@ function normalizeGatewayMessage(message: GatewayMessage, id: string): Message |
     };
   }
   if (roleRaw === "toolresult" || roleRaw === "tool_result" || roleRaw === "tool") {
-    if (!hasText) return null;
-    const prepared = buildAssistantPayload(text);
-    if (!prepared.content && prepared.assistantPayload.events.length === 0 && prepared.assistantPayload.errors.length === 0) {
-      return null;
-    }
-    return {
-      id,
-      role: "assistant",
-      content: prepared.content,
-      kind: "toolResult",
-      toolName: typeof message.toolName === "string" ? message.toolName : undefined,
-      assistantPayload: prepared.assistantPayload,
-      sentAt: messageTimestamp,
-    };
+    return null;
   }
   return null;
 }
@@ -809,6 +867,20 @@ const PROVIDERS: Provider[] = [
 
 const DEFAULT_GATEWAY_URL = "ws://localhost:19789";
 const HISTORY_LIMIT = 500;
+const ACTIVE_RUN_IDLE_TIMEOUT_MS = 120_000;
+const UI_SESSION_KEY_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CHANNEL_SESSION_KEY_MARKERS = [
+  "telegram",
+  "slack",
+  "discord",
+  "whatsapp",
+  "imessage",
+  "signal",
+  "matrix",
+  "googlechat",
+  "google_chat",
+];
 
 function buildSuggestions(userName: string, hasName: boolean) {
   const folderLabel = hasName
@@ -1313,18 +1385,34 @@ export function Chat({
     }
   }
 
+  function refreshActiveRunTimeout(runId: string) {
+    if (!runId || activeRunIdRef.current !== runId) return;
+    if (activeRunTimeoutRef.current) {
+      window.clearTimeout(activeRunTimeoutRef.current);
+      activeRunTimeoutRef.current = null;
+    }
+    activeRunTimeoutRef.current = window.setTimeout(() => {
+      if (activeRunIdRef.current !== runId) return;
+      const lastActivity = lastEventByRunIdRef.current[runId] ?? Date.now();
+      const idleMs = Date.now() - lastActivity;
+      if (idleMs < ACTIVE_RUN_IDLE_TIMEOUT_MS) {
+        refreshActiveRunTimeout(runId);
+        return;
+      }
+      setIsLoading(false);
+      setError("Response timed out waiting for stream activity. Please retry.");
+      addDiag(`run timeout after ${Math.round(ACTIVE_RUN_IDLE_TIMEOUT_MS / 1000)}s idle runId=${runId}`);
+      clearActiveRunTracking();
+    }, ACTIVE_RUN_IDLE_TIMEOUT_MS);
+  }
+
   function scheduleActiveRunTimeout(runId: string, sessionKey: string) {
     clearActiveRunTracking();
     activeRunIdRef.current = runId;
     activeRunSessionRef.current = sessionKey;
     runSessionKeyRef.current[runId] = sessionKey;
-    activeRunTimeoutRef.current = window.setTimeout(() => {
-      if (activeRunIdRef.current !== runId) return;
-      setIsLoading(false);
-      setError("Response timed out. Please retry.");
-      addDiag(`run timeout after 45s runId=${runId}`);
-      clearActiveRunTracking();
-    }, 45_000);
+    lastEventByRunIdRef.current[runId] = Date.now();
+    refreshActiveRunTimeout(runId);
   }
 
   // Emit session list to parent (for sidebar rendering)
@@ -1673,6 +1761,8 @@ export function Chat({
 
   function handleAgentEvent(event: AgentEvent) {
     if (!event?.runId || event.runId !== activeRunIdRef.current) return;
+    lastEventByRunIdRef.current[event.runId] = Date.now();
+    refreshActiveRunTimeout(event.runId);
     const status = describeAgentActivity(event);
     if (status) {
       setThinkingStatus(status);
@@ -1776,6 +1866,9 @@ export function Chat({
     const eventRunId = typeof event?.runId === "string" ? event.runId.trim() : "";
     if (eventRunId) {
       lastEventByRunIdRef.current[eventRunId] = Date.now();
+      if (activeRunIdRef.current === eventRunId) {
+        refreshActiveRunTimeout(eventRunId);
+      }
     }
     const eventSessionKey =
       typeof event?.sessionKey === "string" ? event.sessionKey.trim() : "";
@@ -1956,7 +2049,14 @@ export function Chat({
   }
 
   async function loadSessions() {
-    const gatewaySessions = await clientRef.current?.listSessions() || [];
+    const gatewayAllSessions = await clientRef.current?.listSessions() || [];
+    const gatewaySessions = gatewayAllSessions.filter((session) =>
+      shouldDisplayGatewaySession(session.key),
+    );
+    const filteredSessionCount = gatewayAllSessions.length - gatewaySessions.length;
+    if (filteredSessionCount > 0) {
+      addDiag(`filtered ${filteredSessionCount} non-chat sessions from gateway`);
+    }
     gatewaySessionKeysRef.current = new Set(gatewaySessions.map((s) => s.key));
 
     // Merge with locally cached sessions
