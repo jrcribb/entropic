@@ -600,6 +600,10 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
           message,
           actions: [
             {
+              label: "Open Settings",
+              onClick: () => setCurrentPage("settings"),
+            },
+            {
               label: "Retry",
               onClick: () => {
                 void startGatewayProxyFlow({ model, image, stopFirst: false, allowRetry: false });

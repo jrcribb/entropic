@@ -129,6 +129,43 @@ fn docker_binary_usable(candidate: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn find_colima_binary() -> String {
+    if matches!(Platform::detect(), Platform::MacOS) {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let bundled_release = exe_dir.parent().map(|c| {
+                    c.join("Resources")
+                        .join("resources")
+                        .join("bin")
+                        .join("colima")
+                });
+                if let Some(ref p) = bundled_release {
+                    if p.exists() {
+                        return p.display().to_string();
+                    }
+                }
+
+                let bundled_dev = exe_dir.join("resources").join("bin").join("colima");
+                if bundled_dev.exists() {
+                    return bundled_dev.display().to_string();
+                }
+            }
+        }
+    }
+
+    for candidate in &[
+        "/usr/local/bin/colima",
+        "/opt/homebrew/bin/colima",
+        "/usr/bin/colima",
+    ] {
+        if std::path::Path::new(candidate).exists() {
+            return candidate.to_string();
+        }
+    }
+
+    "colima".to_string()
+}
+
 fn resolve_container_proxy_base(proxy_url: &str) -> Result<String, String> {
     let trimmed = proxy_url.trim();
     if trimmed.is_empty() {
@@ -6161,6 +6198,134 @@ fn process_display_name(command: &str) -> String {
     }
 }
 
+fn collect_legacy_nova_runtime_pids() -> Vec<u32> {
+    if !matches!(Platform::detect(), Platform::MacOS) {
+        return Vec::new();
+    }
+    let output = match Command::new("ps").args(["-axo", "pid=,command="]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+
+    let mut pids = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.splitn(2, char::is_whitespace);
+        let Some(pid_text) = parts.next() else {
+            continue;
+        };
+        let Some(command) = parts.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        let command = command.trim();
+        if command.is_empty() {
+            continue;
+        }
+        if command.contains("/.nova/colima/")
+            || command.contains("/.nova/colima-dev/")
+            || command.contains("colima-nova-vz")
+            || command.contains("colima-nova-qemu")
+            || command.contains("colima daemon start nova-vz")
+            || command.contains("colima daemon start nova-qemu")
+        {
+            pids.push(pid);
+        }
+    }
+
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+fn send_kill_signal(pids: &[u32], signal: &str) -> Result<(), String> {
+    if pids.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = Command::new("kill");
+    cmd.arg(signal);
+    for pid in pids {
+        cmd.arg(pid.to_string());
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to run kill {}: {}", signal, e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.to_lowercase().contains("no such process") {
+        return Ok(());
+    }
+    Err(format!("kill {} failed: {}", signal, stderr.trim()))
+}
+
+fn stop_legacy_nova_runtime_processes(cleanup_log: &mut Vec<String>) {
+    let pids = collect_legacy_nova_runtime_pids();
+    if pids.is_empty() {
+        cleanup_log.push("No legacy Nova runtime processes detected.".to_string());
+        return;
+    }
+
+    cleanup_log.push(format!(
+        "Stopping legacy Nova runtime processes (PIDs: {})...",
+        pids.iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    if let Err(err) = send_kill_signal(&pids, "-TERM") {
+        cleanup_log.push(format!("Warning: {}", err));
+    }
+    std::thread::sleep(Duration::from_millis(400));
+
+    let still_running: Vec<u32> = pids
+        .iter()
+        .copied()
+        .filter(|pid| process_command_line(*pid).is_some())
+        .collect();
+    if still_running.is_empty() {
+        cleanup_log.push("Legacy Nova runtime processes stopped.".to_string());
+        return;
+    }
+
+    cleanup_log.push(format!(
+        "Force-stopping remaining legacy Nova processes (PIDs: {})...",
+        still_running
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    if let Err(err) = send_kill_signal(&still_running, "-KILL") {
+        cleanup_log.push(format!("Warning: {}", err));
+    }
+    std::thread::sleep(Duration::from_millis(250));
+
+    let stubborn: Vec<u32> = still_running
+        .iter()
+        .copied()
+        .filter(|pid| process_command_line(*pid).is_some())
+        .collect();
+    if stubborn.is_empty() {
+        cleanup_log.push("Legacy Nova runtime processes force-stopped.".to_string());
+    } else {
+        cleanup_log.push(format!(
+            "Warning: Some legacy Nova runtime processes are still running (PIDs: {}).",
+            stubborn
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+}
+
 fn gateway_port_conflict_hint(last_error: &str) -> Option<String> {
     if !matches!(Platform::detect(), Platform::MacOS) {
         return None;
@@ -6191,14 +6356,15 @@ fn gateway_port_conflict_hint(last_error: &str) -> Option<String> {
             return Some(format!(
                 "Detected legacy Nova runtime process (PID {}) owning localhost:19789. \
 Entropic is connecting to the wrong gateway instance, which causes gateway token mismatch. \
-Quit Nova.app (or run `kill {}`) and retry Gateway start.",
+Use Entropic Settings > Reset Application to clean up legacy runtime state, then retry Gateway start. \
+If needed, quit Nova.app (or run `kill {}`).",
                 pid, pid
             ));
         }
         let display = process_display_name(&command);
         return Some(format!(
             "Port conflict detected: localhost:19789 is owned by PID {} ({}), not Entropic runtime. \
-Stop the conflicting process and retry Gateway start.",
+Open Entropic Settings > Reset Application (or stop the conflicting process) and retry Gateway start.",
             pid, display
         ));
     }
@@ -6454,8 +6620,11 @@ pub async fn cleanup_app_data(app: AppHandle, include_vms: bool) -> Result<Strin
     // Clean up Docker resources if requested
     if include_vms {
         cleanup_log.push("Cleaning up Docker resources...".to_string());
+        stop_legacy_nova_runtime_processes(&mut cleanup_log);
 
         let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
+        let docker_bin = find_docker_binary();
+        let colima_bin = find_colima_binary();
 
         // Try to clean up Docker using shell commands
         let colima_homes = vec![
@@ -6478,7 +6647,7 @@ pub async fn cleanup_app_data(app: AppHandle, include_vms: bool) -> Result<Strin
                     let host = format!("unix://{}", socket.display());
 
                     // Remove containers
-                    let _ = std::process::Command::new("docker")
+                    let _ = std::process::Command::new(&docker_bin)
                         .args(&["ps", "-aq"])
                         .env("DOCKER_HOST", &host)
                         .output()
@@ -6486,7 +6655,7 @@ pub async fn cleanup_app_data(app: AppHandle, include_vms: bool) -> Result<Strin
                             let containers = String::from_utf8_lossy(&out.stdout);
                             for container_id in containers.lines().filter(|l| !l.trim().is_empty())
                             {
-                                let _ = std::process::Command::new("docker")
+                                let _ = std::process::Command::new(&docker_bin)
                                     .args(&["rm", "-f", container_id])
                                     .env("DOCKER_HOST", &host)
                                     .output();
@@ -6495,7 +6664,7 @@ pub async fn cleanup_app_data(app: AppHandle, include_vms: bool) -> Result<Strin
                         });
 
                     // System prune
-                    let _ = std::process::Command::new("docker")
+                    let _ = std::process::Command::new(&docker_bin)
                         .args(&["system", "prune", "-af", "--volumes"])
                         .env("DOCKER_HOST", &host)
                         .output();
@@ -6519,7 +6688,7 @@ pub async fn cleanup_app_data(app: AppHandle, include_vms: bool) -> Result<Strin
             };
             cleanup_log.push(format!("{} {}...", prefix, colima_home.display()));
             for profile in &profiles {
-                let _ = std::process::Command::new("colima")
+                let _ = std::process::Command::new(&colima_bin)
                     .args(&["delete", "-f", "-p", profile])
                     .env("COLIMA_HOME", colima_home)
                     .env("LIMA_HOME", colima_home.join("_lima"))
