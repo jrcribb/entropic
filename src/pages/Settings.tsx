@@ -39,6 +39,8 @@ type AgentProfileState = {
   memory_enabled?: boolean;
   memory_qmd_enabled?: boolean;
   soul?: string;
+  identity_name?: string;
+  identity_avatar?: string | null;
 };
 
 type GatewayConfigHealth = {
@@ -168,6 +170,29 @@ export function Settings({
       setMemorySessionIndexing(Boolean(state.memory_sessions_enabled));
       setMemoryEnabled(state.memory_enabled ?? true);
       setMemoryQmdEnabled(Boolean(state.memory_qmd_enabled));
+      const hasIdentityName = Object.prototype.hasOwnProperty.call(state, "identity_name");
+      const hasIdentityAvatar = Object.prototype.hasOwnProperty.call(state, "identity_avatar");
+      if (hasIdentityName || hasIdentityAvatar) {
+        setProfile((prev) => {
+          const next: AgentProfile = {
+            name:
+              hasIdentityName && typeof state.identity_name === "string" && state.identity_name.trim()
+                ? state.identity_name.trim()
+                : prev.name,
+            avatarDataUrl: hasIdentityAvatar
+              ? typeof state.identity_avatar === "string" && state.identity_avatar.trim()
+                ? state.identity_avatar.trim()
+                : undefined
+              : prev.avatarDataUrl,
+          };
+          if (next.name !== prev.name || next.avatarDataUrl !== prev.avatarDataUrl) {
+            saveProfile(next)
+              .then(() => window.dispatchEvent(new Event("entropic-profile-updated")))
+              .catch(() => {});
+          }
+          return next;
+        });
+      }
     }).catch(() => {});
     Store.load("entropic-settings.json").then(async (store) => {
       const wp = (await store.get("desktopWallpaper")) as string | null;
@@ -537,6 +562,10 @@ export function Settings({
                     saveProfile(next)
                       .then(() => window.dispatchEvent(new Event("entropic-profile-updated")))
                       .catch(() => {});
+                    invoke("set_identity", {
+                      name: next.name,
+                      avatarDataUrl: next.avatarDataUrl ?? null,
+                    }).catch(() => {});
                     return next;
                   });
                 };
@@ -556,6 +585,12 @@ export function Settings({
                   setProfile(p => ({ ...p, name: newName }));
                   saveProfile({ ...profile, name: newName }).catch(() => {});
                   window.dispatchEvent(new Event("entropic-profile-updated"));
+                }}
+                onBlur={(e) => {
+                  invoke("set_identity", {
+                    name: e.target.value,
+                    avatarDataUrl: profile.avatarDataUrl ?? null,
+                  }).catch(() => {});
                 }}
                 className="w-full bg-transparent text-xl font-bold text-[var(--text-primary)] focus:outline-none border-b border-transparent focus:border-[var(--system-blue)] transition-colors placeholder:text-[var(--text-tertiary)]"
                 placeholder="Name your agent"

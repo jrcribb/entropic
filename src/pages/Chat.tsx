@@ -1,30 +1,46 @@
-import { useState, useRef, useEffect, useCallback, type FormEvent } from "react";
+import { useState, useRef, useEffect, useCallback, type ComponentType, type FormEvent } from "react";
 import {
   Send,
   Sparkles,
   X,
   Loader2,
   ExternalLink,
-  MessageSquare,
   Calendar,
-  Globe,
   Mail,
+  Globe,
   Activity,
   TrendingUp,
-  FolderPlus,
   ChevronDown,
   ChevronUp,
+  Bot,
+  User,
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-shell";
 import { invoke } from "@tauri-apps/api/core";
 import clsx from "clsx";
 import { GatewayClient, createGatewayClient, type ChatEvent, type AgentEvent, type GatewayMessage } from "../lib/gateway";
-import { loadOnboardingData, loadProfile, type OnboardingData, type AgentProfile } from "../lib/profile";
+import { loadOnboardingData, loadProfile, saveProfile, type OnboardingData, type AgentProfile } from "../lib/profile";
 import { SuggestionChip, type SuggestionAction } from "../components/SuggestionChip";
 import { ChannelSetupModal } from "../components/ChannelSetupModal";
+import { TelegramSetupModal } from "../components/TelegramSetupModal";
 import { MarkdownContent } from "../components/MarkdownContent";
 import { useAuth } from "../contexts/AuthContext";
-import { syncAllIntegrationsToGateway, getCachedIntegrationProviders, getIntegrations } from "../lib/integrations";
+import {
+  syncAllIntegrationsToGateway,
+  getCachedIntegrationProviders,
+  getIntegrations,
+  connectIntegration,
+} from "../lib/integrations";
+import {
+  getVisibleQuickActions,
+  getQuickActionById,
+  getTaskPresetLabel,
+  getScheduleForTaskPreset,
+  type AgentQuickActionDefinition,
+  type ChatQuickActionIcon,
+  type IntegrationQuickActionRequirement,
+  type SuggestionTaskPreset,
+} from "../lib/chatQuickActions";
 import { resolveGatewayAuth } from "../lib/gateway-auth";
 import { appendDiagnosticLog } from "../lib/diagnostics";
 import { Store as TauriStore } from "@tauri-apps/plugin-store";
@@ -102,6 +118,36 @@ function getInitials(name: string): string {
   const parts = name.trim().split(/\s+/);
   if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
   return name.slice(0, 2).toUpperCase();
+}
+
+function GoogleCalendarLogo({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+      <path fill="#4285F4" d="M19 4h-1V2h-2v2H8V2H6v2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 16H5V9h14v11z" />
+      <path fill="#FBBC05" d="M5 20h14v2H5z" />
+      <path fill="#34A853" d="M19 4h2v5h-2z" />
+      <path fill="#EA4335" d="M5 4h2v5H5z" />
+    </svg>
+  );
+}
+
+function GmailLogo({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+      <path fill="#EA4335" d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V8l8 5 8-5v10zm-8-7L4 6h16l-8 5z" />
+    </svg>
+  );
+}
+
+function XLogo({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+      <path
+        fill="currentColor"
+        d="M18.9 3H22l-6.8 7.8L23 21h-6.2l-4.9-6.1L6.6 21H3.5l7.3-8.3L1 3h6.3l4.4 5.6L18.9 3zm-1.1 16h1.7L7.5 4.9H5.7L17.8 19z"
+      />
+    </svg>
+  );
 }
 
 // ── Local chat persistence ─────────────────────────────────────
@@ -689,6 +735,12 @@ function extractMessageTimestamp(message: GatewayMessage): number | null {
 
 function normalizeUserContent(content: string, fallbackTimestamp?: number | null): { content: string; sentAt: number | null } {
   const withoutMeta = stripConversationMetadata(content).trim();
+  if (withoutMeta.startsWith(INTERNAL_USER_PROMPT_PREFIX)) {
+    return {
+      content: "",
+      sentAt: fallbackTimestamp ?? null,
+    };
+  }
   const parsedPrefix = parseUtcBracketTimestamp(withoutMeta);
   return {
     content: parsedPrefix.text.trim(),
@@ -901,24 +953,50 @@ const CHANNEL_SESSION_KEY_MARKERS = [
   "googlechat",
   "google_chat",
 ];
+const INTERNAL_USER_PROMPT_PREFIX = "[[ENTROPIC_INTERNAL_PROMPT]]";
 
-function buildSuggestions(userName: string, hasName: boolean) {
-  const folderLabel = hasName
-    ? `Create a ${userName} Folder to save documents in Home`
-    : "Create a Folder to save documents in Home";
-  const folderMessage = hasName
-    ? `Create a ${userName} folder in Home to save documents.`
-    : "Create a folder in Home to save documents.";
-  return [
-    { icon: MessageSquare, label: "Message me on iMessage", action: { type: "channel", channel: "imessage" } as SuggestionAction },
-    { icon: MessageSquare, label: "Message me on WhatsApp", action: { type: "channel", channel: "whatsapp" } as SuggestionAction },
-    { icon: Mail, label: "Clean up my inbox", action: { type: "agent", message: "Help me clean up and organize my email inbox", requiresIntegration: "google_email" } as SuggestionAction },
-    { icon: Calendar, label: "Check my calendar", action: { type: "agent", message: "What's on my calendar for today and tomorrow?", requiresIntegration: "google_calendar" } as SuggestionAction },
-    { icon: TrendingUp, label: "Search Trending News on X", action: { type: "agent", message: "Search trending news on X and summarize what’s popular right now.", requiresIntegration: "x" } as SuggestionAction },
-    { icon: Globe, label: "Browse the web for me", action: { type: "agent", message: "I'd like you to browse the web and research something for me." } as SuggestionAction },
-    { icon: Activity, label: "Write a todo list for this week in Home", action: { type: "agent", message: "Write a todo list for this week and save it in Home." } as SuggestionAction },
-    { icon: FolderPlus, label: folderLabel, action: { type: "agent", message: folderMessage } as SuggestionAction },
-  ];
+const QUICK_ACTION_ICONS: Record<ChatQuickActionIcon, typeof Mail> = {
+  mail: Mail,
+  calendar: Calendar,
+  trending: TrendingUp,
+  globe: Globe,
+  activity: Activity,
+  bot: Bot,
+  user: User,
+};
+
+const INTEGRATION_LOGOS: Record<
+  IntegrationQuickActionRequirement["provider"],
+  ComponentType<{ className?: string }>
+> = {
+  google_email: GmailLogo,
+  google_calendar: GoogleCalendarLogo,
+  x: XLogo,
+};
+
+const CRON_GUARD_LINES = [
+  "This is a scheduled run. Do NOT create, edit, or run cron jobs.",
+  "Do NOT use gateway or exec tools. Just perform the task now and report results.",
+];
+const CRON_GUARD_BLOCK = `${CRON_GUARD_LINES.join("\n")}\n\n`;
+
+type IntegrationSetupState = {
+  requirement: IntegrationQuickActionRequirement;
+  pendingAction: AgentQuickActionDefinition;
+  status: "idle" | "connecting" | "awaiting_callback";
+  error: string | null;
+};
+
+type QuickSuggestionState = {
+  action: AgentQuickActionDefinition;
+  taskName: string;
+  taskPreset: SuggestionTaskPreset;
+  creatingTask: boolean;
+  error: string | null;
+};
+
+function integrationRequirementLabel(requirement: IntegrationQuickActionRequirement): string {
+  return requirement.label;
 }
 
 function normalizeModelId(id: string | null | undefined, proxyMode: boolean): string | null {
@@ -1041,11 +1119,19 @@ export function Chat({
   }>>({});
   const sessionModelRef = useRef<Record<string, string | null>>({});
   const runRevertModelRef = useRef<Record<string, string | null>>({});
-  const [channelConfig, setChannelConfig] = useState<{ imessageEnabled: boolean; whatsappEnabled: boolean } | null>(null);
+  const [channelConfig, setChannelConfig] = useState<{
+    imessageEnabled: boolean;
+    whatsappEnabled: boolean;
+    telegramEnabled: boolean;
+    telegramConnected: boolean;
+  } | null>(null);
   const [channelModal, setChannelModal] = useState<{ isOpen: boolean; channel: "imessage" | "whatsapp" }>({
     isOpen: false,
     channel: "imessage",
   });
+  const [telegramSetupOpen, setTelegramSetupOpen] = useState(false);
+  const [integrationSetupBySession, setIntegrationSetupBySession] = useState<Record<string, IntegrationSetupState>>({});
+  const [quickSuggestionBySession, setQuickSuggestionBySession] = useState<Record<string, QuickSuggestionState>>({});
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1077,6 +1163,33 @@ export function Chat({
   const runHistoryRecoveryRef = useRef<Record<string, boolean>>({});
   const gatewaySessionKeysRef = useRef<Set<string>>(new Set());
   const visibleMessagesSessionRef = useRef<string | null>(null);
+  const builderSessionsRef = useRef<Set<string>>(new Set());
+  const integrationSetup = currentSession ? integrationSetupBySession[currentSession] || null : null;
+  const quickSuggestion = currentSession ? quickSuggestionBySession[currentSession] || null : null;
+
+  function setIntegrationSetupForSession(sessionKey: string, value: IntegrationSetupState | null) {
+    setIntegrationSetupBySession((prev) => {
+      const next = { ...prev };
+      if (value) {
+        next[sessionKey] = value;
+      } else {
+        delete next[sessionKey];
+      }
+      return next;
+    });
+  }
+
+  function setQuickSuggestionForSession(sessionKey: string, value: QuickSuggestionState | null) {
+    setQuickSuggestionBySession((prev) => {
+      const next = { ...prev };
+      if (value) {
+        next[sessionKey] = value;
+      } else {
+        delete next[sessionKey];
+      }
+      return next;
+    });
+  }
 
   function requestSignIn() {
     window.dispatchEvent(
@@ -1270,17 +1383,29 @@ export function Chat({
   }
 
   useEffect(() => {
-    invoke<{
-      imessage_enabled: boolean;
-      whatsapp_enabled: boolean;
-    }>("get_agent_profile_state")
-      .then((state) => {
+    let cancelled = false;
+    Promise.all([
+      invoke<{
+        imessage_enabled?: boolean;
+        whatsapp_enabled?: boolean;
+        telegram_enabled?: boolean;
+        telegram_token?: string;
+      }>("get_agent_profile_state"),
+      invoke<boolean>("get_telegram_connection_status").catch(() => false),
+    ])
+      .then(([state, telegramConnected]) => {
+        if (cancelled) return;
         setChannelConfig({
           imessageEnabled: state.imessage_enabled ?? false,
           whatsappEnabled: state.whatsapp_enabled ?? false,
+          telegramEnabled: Boolean(state.telegram_enabled && state.telegram_token?.trim()),
+          telegramConnected: Boolean(telegramConnected),
         });
       })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Restore sessions from local cache on mount
@@ -1351,6 +1476,28 @@ export function Chat({
         return next;
       }
       const next = { ...prev, [to]: fromDraft };
+      delete next[from];
+      return next;
+    });
+
+    setIntegrationSetupBySession((prev) => {
+      const fromSetup = prev[from];
+      if (!fromSetup) return prev;
+      const next = { ...prev };
+      if (!next[to]) {
+        next[to] = fromSetup;
+      }
+      delete next[from];
+      return next;
+    });
+
+    setQuickSuggestionBySession((prev) => {
+      const fromSuggestion = prev[from];
+      if (!fromSuggestion) return prev;
+      const next = { ...prev };
+      if (!next[to]) {
+        next[to] = fromSuggestion;
+      }
       delete next[from];
       return next;
     });
@@ -1520,7 +1667,7 @@ export function Chat({
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: isLoading ? "auto" : "smooth" });
-  }, [messages, isLoading]);
+  }, [messages, isLoading, integrationSetup, quickSuggestion]);
 
   useEffect(() => {
     currentSessionRef.current = currentSession;
@@ -2097,6 +2244,10 @@ export function Chat({
           }).catch(() => {});
           schedulePersist();
         }
+        const completedSessionKey = knownSessionKey || currentSessionRef.current || "";
+        if (completedSessionKey && builderSessionsRef.current.has(completedSessionKey)) {
+          void syncDesktopProfileFromIdentity();
+        }
       }
     } else if (event.state === "error") {
       const errorMessage = formatAssistantErrorTextForUi(event.errorMessage || "Chat error");
@@ -2331,6 +2482,8 @@ export function Chat({
       const snapshotSession = sessionsRef.current.find((session) => session.key === action.key);
       const snapshotMessages = sessionMessagesRef.current[action.key] || [];
       const snapshotDraft = draftsRef.current[action.key] || "";
+      const snapshotIntegrationSetup = integrationSetupBySession[action.key] || null;
+      const snapshotQuickSuggestion = quickSuggestionBySession[action.key] || null;
       const deletingCurrent = currentSessionRef.current === action.key;
       const remaining = normalizeSessionsList(
         sessionsRef.current.filter((session) => session.key !== action.key),
@@ -2341,6 +2494,18 @@ export function Chat({
       delete nextMessages[action.key];
       sessionMessagesRef.current = nextMessages;
       setDraftsBySession((prev) => {
+        const next = { ...prev };
+        delete next[action.key];
+        return next;
+      });
+      setIntegrationSetupBySession((prev) => {
+        if (!prev[action.key]) return prev;
+        const next = { ...prev };
+        delete next[action.key];
+        return next;
+      });
+      setQuickSuggestionBySession((prev) => {
+        if (!prev[action.key]) return prev;
         const next = { ...prev };
         delete next[action.key];
         return next;
@@ -2370,6 +2535,12 @@ export function Chat({
           }
           if (snapshotDraft) {
             setDraftsBySession((prev) => ({ ...prev, [action.key]: snapshotDraft }));
+          }
+          if (snapshotIntegrationSetup) {
+            setIntegrationSetupBySession((prev) => ({ ...prev, [action.key]: snapshotIntegrationSetup }));
+          }
+          if (snapshotQuickSuggestion) {
+            setQuickSuggestionBySession((prev) => ({ ...prev, [action.key]: snapshotQuickSuggestion }));
           }
           schedulePersist();
           if (deletingCurrent) {
@@ -2546,62 +2717,500 @@ export function Chat({
     return s.label || s.derivedTitle || s.displayName || `Chat ${s.key.slice(0, 8)}`;
   }
 
-  async function handleSuggestionClick(action: SuggestionAction) {
-    if (action.type === "channel") {
-      let config = channelConfig;
-      if (!config) {
-        try {
-          const state = await invoke<{
-            imessage_enabled: boolean;
-            whatsapp_enabled: boolean;
-          }>("get_agent_profile_state");
-          config = {
-            imessageEnabled: state.imessage_enabled ?? false,
-            whatsappEnabled: state.whatsapp_enabled ?? false,
-          };
-          setChannelConfig(config);
-        } catch {
-          onNavigate?.("channels");
-          return;
-        }
-      }
-      const enabled =
-        action.channel === "imessage" ? config.imessageEnabled : config.whatsappEnabled;
-      if (!enabled) {
-        addDiag(`channel ${action.channel} not configured; redirecting to Messaging`);
-        onNavigate?.("channels");
+  function appendAssistantNotice(content: string, sessionKeyInput?: string) {
+    const sessionKey = sessionKeyInput || ensureComposerSession();
+    if (!sessionKey) return;
+    const notice: Message = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content,
+      sentAt: Date.now(),
+    };
+    if (currentSessionRef.current === sessionKey) {
+      setShowWelcome(false);
+      visibleMessagesSessionRef.current = sessionKey;
+      setMessages((prev) => [...prev, notice]);
+    }
+    const cachedMsgs = sessionMessagesRef.current[sessionKey] || [];
+    sessionMessagesRef.current[sessionKey] = [...cachedMsgs, notice];
+    setSessions((prev) => {
+      const updated = prev.some((s) => s.key === sessionKey)
+        ? prev.map((s) => (s.key === sessionKey ? { ...s, updatedAt: Date.now() } : s))
+        : [{ key: sessionKey, updatedAt: Date.now() }, ...prev];
+      return applySessionTitles(normalizeSessionsList(updated));
+    });
+    schedulePersist();
+  }
+
+  async function isIntegrationReady(provider: IntegrationQuickActionRequirement["provider"]): Promise<boolean> {
+    const integrations = await getIntegrations({ force: true });
+    const entry = integrations.find((item) => item.provider === provider);
+    return Boolean(entry && entry.connected && !entry.stale);
+  }
+
+  function openQuickSuggestion(action: AgentQuickActionDefinition, sessionKeyInput?: string) {
+    const sessionKey = sessionKeyInput || ensureComposerSession();
+    if (!sessionKey) return;
+    setQuickSuggestionForSession(sessionKey, {
+      action,
+      taskName: action.label,
+      taskPreset: action.taskPreset || "daily",
+      creatingTask: false,
+      error: null,
+    });
+    setIntegrationSetupForSession(sessionKey, null);
+  }
+
+  function resolveQuickActionMessage(action: AgentQuickActionDefinition): string {
+    const userName = onboardingData?.userName?.trim();
+    if (!userName) return action.message;
+    return action.message.split("<Your Name>").join(userName);
+  }
+
+  async function syncDesktopProfileFromIdentity() {
+    try {
+      const state = await invoke<{
+        identity_name?: string;
+        identity_avatar?: string | null;
+      }>("get_agent_profile_state");
+      const current = await loadProfile();
+      const nextName =
+        typeof state.identity_name === "string" && state.identity_name.trim()
+          ? state.identity_name.trim()
+          : current.name;
+      const nextAvatar =
+        typeof state.identity_avatar === "string" && state.identity_avatar.trim()
+          ? state.identity_avatar.trim()
+          : undefined;
+      if (nextName === current.name && nextAvatar === current.avatarDataUrl) {
         return;
       }
-      setChannelModal({ isOpen: true, channel: action.channel });
-    } else if (action.type === "agent") {
-      if (action.requiresIntegration) {
-        try {
-          const integrations = await getIntegrations();
-          const entry = integrations.find((item) => item.provider === action.requiresIntegration);
-          if (!entry || !entry.connected || entry.stale) {
-            addDiag(`suggestion requires ${action.requiresIntegration}; redirecting to Plugins`);
-            onNavigate?.("store");
-            return;
-          }
-        } catch {
-          onNavigate?.("store");
-          return;
-        }
-      }
-      handleSend(action.message);
+      await saveProfile({
+        name: nextName,
+        avatarDataUrl: nextAvatar,
+      });
+      window.dispatchEvent(new Event("entropic-profile-updated"));
+    } catch {
+      // ignore profile sync failures; identity files remain source of truth
     }
   }
+
+  async function connectIntegrationInChat() {
+    const sessionKey = currentSessionRef.current;
+    if (!sessionKey) return;
+    const setup = integrationSetupBySession[sessionKey];
+    if (!setup) return;
+    setIntegrationSetupForSession(sessionKey, { ...setup, status: "connecting", error: null });
+    try {
+      await connectIntegration(setup.requirement.provider);
+      const connectedNow = await isIntegrationReady(setup.requirement.provider);
+      if (connectedNow) {
+        setIntegrationSetupForSession(sessionKey, null);
+        setError(null);
+        appendAssistantNotice(
+          `${integrationRequirementLabel(setup.requirement)} connected. Ready to run "${setup.pendingAction.label}".`,
+          sessionKey
+        );
+        openQuickSuggestion(setup.pendingAction, sessionKey);
+        return;
+      }
+      setIntegrationSetupForSession(sessionKey, { ...setup, status: "awaiting_callback", error: null });
+      appendAssistantNotice(
+        `Finish ${integrationRequirementLabel(setup.requirement)} setup in your browser, then click "Verify connection".`,
+        sessionKey
+      );
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Failed to connect integration";
+      setIntegrationSetupForSession(sessionKey, { ...setup, status: "idle", error: message });
+    }
+  }
+
+  async function verifyPendingIntegrationSetup() {
+    const sessionKey = currentSessionRef.current;
+    if (!sessionKey) return;
+    const setup = integrationSetupBySession[sessionKey];
+    if (!setup) return;
+    setIntegrationSetupForSession(sessionKey, { ...setup, status: "connecting", error: null });
+    try {
+      const connectedNow = await isIntegrationReady(setup.requirement.provider);
+      if (!connectedNow) {
+        setIntegrationSetupForSession(sessionKey, {
+          ...setup,
+          status: "awaiting_callback",
+          error: `${integrationRequirementLabel(setup.requirement)} is not connected yet.`,
+        });
+        return;
+      }
+      setIntegrationSetupForSession(sessionKey, null);
+      setError(null);
+      appendAssistantNotice(
+        `${integrationRequirementLabel(setup.requirement)} connected. Ready to run "${setup.pendingAction.label}".`,
+        sessionKey
+      );
+      openQuickSuggestion(setup.pendingAction, sessionKey);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Failed to verify integration";
+      setIntegrationSetupForSession(sessionKey, { ...setup, status: "awaiting_callback", error: message });
+    }
+  }
+
+  function runQuickSuggestionNow() {
+    const sessionKey = currentSessionRef.current;
+    if (!sessionKey) return;
+    const quick = quickSuggestionBySession[sessionKey];
+    if (!quick) return;
+    const action = quick.action;
+    setQuickSuggestionForSession(sessionKey, null);
+    setShowWelcome(false);
+    void handleSend(action.message);
+  }
+
+  async function createQuickSuggestionTask() {
+    const sessionKey = currentSessionRef.current;
+    if (!sessionKey) return;
+    const quick = quickSuggestionBySession[sessionKey];
+    if (!quick) return;
+    if (!gatewayRunning) {
+      setQuickSuggestionForSession(sessionKey, {
+        ...quick,
+        error: "Start the gateway to create scheduled tasks.",
+      });
+      return;
+    }
+
+    setQuickSuggestionForSession(sessionKey, { ...quick, creatingTask: true, error: null });
+    const taskName = quick.taskName.trim() || quick.action.label;
+    try {
+      const auth = await resolveGatewayAuth();
+      const taskClient = createGatewayClient(auth.wsUrl, auth.token);
+      await taskClient.connect();
+      try {
+        await taskClient.addCronJob({
+          name: taskName,
+          description: `Created from chat quick action: ${quick.action.label}`,
+          schedule: getScheduleForTaskPreset(quick.taskPreset),
+          payload: {
+            kind: "agentTurn",
+            message: `${CRON_GUARD_BLOCK}${quick.action.message}`,
+            deliver: false,
+          },
+          sessionTarget: "main",
+          wakeMode: "next-heartbeat",
+          enabled: true,
+        });
+      } finally {
+        taskClient.disconnect();
+      }
+      setQuickSuggestionForSession(sessionKey, null);
+      setShowWelcome(false);
+      appendAssistantNotice(
+        `Scheduled task "${taskName}" created (${getTaskPresetLabel(quick.taskPreset)}). I can run "${quick.action.label}" automatically now.`,
+        sessionKey
+      );
+      window.dispatchEvent(new Event("entropic-tasks-updated"));
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "Failed to create scheduled task";
+      setQuickSuggestionForSession(sessionKey, { ...quick, creatingTask: false, error: message });
+    }
+  }
+
+  function renderIntegrationSetupAssistantCard() {
+    if (!integrationSetup) return null;
+    const setup = integrationSetup;
+    const RequirementLogo = INTEGRATION_LOGOS[setup.requirement.provider];
+
+    return (
+      <div className="flex justify-start">
+        <div className="max-w-[85%] sm:max-w-[72%]">
+          <div className="px-4 py-3 rounded-2xl bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--glass-border-subtle)]">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <img src={entropicLogo} alt="Entropic" className="w-5 h-5 rounded-md" />
+                <span className="text-xs font-semibold text-[var(--text-primary)]">Agent setup flow</span>
+              </div>
+              <button
+                onClick={() => {
+                  if (!currentSession) return;
+                  setIntegrationSetupForSession(currentSession, null);
+                }}
+                className="text-xs text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+              >
+                Cancel request
+              </button>
+            </div>
+
+            <div className="flex flex-wrap gap-2 mt-3">
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--glass-border-subtle)] bg-white/70 px-2 py-1 text-[11px] text-[var(--text-secondary)]">
+                <RequirementLogo className="w-3.5 h-3.5 text-[var(--text-primary)]" />
+                Plugin: {integrationRequirementLabel(setup.requirement)}
+              </span>
+            </div>
+
+            <p className="text-sm font-semibold text-[var(--text-primary)] mt-3">
+              Connect {integrationRequirementLabel(setup.requirement)} in chat
+            </p>
+            <p className="text-xs text-[var(--text-secondary)] mt-1">
+              "{setup.pendingAction.label}" requires {integrationRequirementLabel(setup.requirement)}.
+              Complete setup below and I will continue this flow in chat.
+            </p>
+
+            <ol className="mt-2 text-[11px] text-[var(--text-tertiary)] space-y-1 list-decimal list-inside">
+              <li>Click Connect now.</li>
+              <li>Complete authorization in your browser.</li>
+              <li>Return here and click Verify connection.</li>
+            </ol>
+
+            {setup.error ? <p className="text-xs text-red-600 mt-2">{setup.error}</p> : null}
+
+            <div className="flex flex-wrap gap-2 mt-3">
+              <button
+                onClick={connectIntegrationInChat}
+                disabled={setup.status === "connecting"}
+                className="btn-primary !text-xs !py-1.5"
+              >
+                {setup.status === "connecting" ? "Connecting..." : "Connect now"}
+              </button>
+              <button
+                onClick={verifyPendingIntegrationSetup}
+                disabled={setup.status === "connecting"}
+                className="btn-secondary !text-xs !py-1.5"
+              >
+                Verify connection
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderQuickSuggestionAssistantCard() {
+    if (!quickSuggestion) return null;
+    const quick = quickSuggestion;
+    const requirement = quick.action.requirement?.kind === "integration" ? quick.action.requirement : null;
+    const RequirementLogo = requirement ? INTEGRATION_LOGOS[requirement.provider] : null;
+
+    return (
+      <div className="flex justify-start">
+        <div className="max-w-[85%] sm:max-w-[72%]">
+          <div className="px-4 py-3 rounded-2xl bg-[var(--bg-tertiary)] text-[var(--text-primary)] border border-[var(--glass-border-subtle)]">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <img src={entropicLogo} alt="Entropic" className="w-5 h-5 rounded-md" />
+                <span className="text-xs font-semibold text-[var(--text-primary)]">Agent action ready</span>
+              </div>
+              <button
+                onClick={() => {
+                  if (!currentSession) return;
+                  setQuickSuggestionForSession(currentSession, null);
+                }}
+                className="text-xs text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+              >
+                Close
+              </button>
+            </div>
+
+            <div className="flex flex-wrap gap-2 mt-3">
+              {RequirementLogo && requirement ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--glass-border-subtle)] bg-white/70 px-2 py-1 text-[11px] text-[var(--text-secondary)]">
+                  <RequirementLogo className="w-3.5 h-3.5 text-[var(--text-primary)]" />
+                  Plugin: {integrationRequirementLabel(requirement)}
+                </span>
+              ) : null}
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--glass-border-subtle)] bg-white/70 px-2 py-1 text-[11px] text-[var(--text-secondary)]">
+                <Calendar className="w-3.5 h-3.5 text-[var(--text-primary)]" />
+                Task: {getTaskPresetLabel(quick.taskPreset)}
+              </span>
+            </div>
+
+            <p className="text-sm font-semibold text-[var(--text-primary)] mt-3">
+              {quick.action.label}
+            </p>
+            <p className="text-xs text-[var(--text-secondary)] mt-1">
+              Run this now in chat, or create a recurring task.
+            </p>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3">
+              <input
+                value={quick.taskName}
+                onChange={(e) =>
+                  currentSession
+                    ? setQuickSuggestionForSession(currentSession, {
+                        ...quick,
+                        taskName: e.target.value,
+                        error: null,
+                      })
+                    : undefined
+                }
+                placeholder="Task name"
+                className="form-input !py-2"
+              />
+              <select
+                value={quick.taskPreset}
+                onChange={(e) =>
+                  currentSession
+                    ? setQuickSuggestionForSession(currentSession, {
+                        ...quick,
+                        taskPreset: (e.target.value as SuggestionTaskPreset) || "daily",
+                        error: null,
+                      })
+                    : undefined
+                }
+                className="form-input !py-2"
+              >
+                <option value="daily">Daily at 9:00</option>
+                <option value="daily_10am">Daily at 10:00</option>
+                <option value="weekdays">Weekdays at 9:00</option>
+                <option value="hourly">Every hour</option>
+              </select>
+            </div>
+
+            {quick.error ? <p className="text-xs text-red-600 mt-2">{quick.error}</p> : null}
+
+            <div className="flex flex-wrap gap-2 mt-3">
+              <button
+                onClick={runQuickSuggestionNow}
+                disabled={isLoading || quick.creatingTask}
+                className="btn-primary !text-xs !py-1.5"
+              >
+                Run once in chat
+              </button>
+              <button
+                onClick={createQuickSuggestionTask}
+                disabled={quick.creatingTask}
+                className="btn-secondary !text-xs !py-1.5"
+              >
+                {quick.creatingTask
+                  ? "Creating task..."
+                  : `Create task (${getTaskPresetLabel(quick.taskPreset)})`}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  async function handleSuggestionClick(action: SuggestionAction) {
+    setError(null);
+    if (action.type !== "quick_action") return;
+    const quickAction = getQuickActionById(action.actionId);
+    if (!quickAction) return;
+    const sessionKey = currentSessionRef.current || ensureComposerSession();
+    if (!sessionKey) return;
+
+    if (quickAction.handoffPage && onNavigate) {
+      onNavigate(quickAction.handoffPage);
+      if (quickAction.handoffPage === "channels") {
+        appendAssistantNotice("Open Messaging to set up Telegram, then come back here to run it in chat.", sessionKey);
+      } else if (quickAction.handoffPage === "store") {
+        appendAssistantNotice("Open Plugins to connect this integration, then return to run it in chat.", sessionKey);
+      }
+      return;
+    }
+
+    if (quickAction.kind === "telegram_setup") {
+      setTelegramSetupOpen(true);
+      return;
+    }
+
+    const requirement = quickAction.requirement;
+    if (requirement?.kind === "integration") {
+      try {
+        const connectedNow = await isIntegrationReady(requirement.provider);
+        if (!connectedNow) {
+          addDiag(`suggestion requires ${requirement.provider}; opening in-chat setup`);
+          setIntegrationSetupForSession(sessionKey, {
+            requirement,
+            pendingAction: quickAction,
+            status: "idle",
+            error: null,
+          });
+          setQuickSuggestionForSession(sessionKey, null);
+          appendAssistantNotice(
+            `To run "${quickAction.label}", connect ${integrationRequirementLabel(requirement)} in chat. I will continue once it is connected.`,
+            sessionKey
+          );
+          return;
+        }
+      } catch {
+        setIntegrationSetupForSession(sessionKey, {
+          requirement,
+          pendingAction: quickAction,
+          status: "idle",
+          error: `Failed to check ${integrationRequirementLabel(requirement)} status.`,
+        });
+        setQuickSuggestionForSession(sessionKey, null);
+        return;
+      }
+    }
+
+    if (quickAction.runMode === "direct_send") {
+      setIntegrationSetupForSession(sessionKey, null);
+      setQuickSuggestionForSession(sessionKey, null);
+      setShowWelcome(false);
+      if (quickAction.id === "build_agent_identity") {
+        builderSessionsRef.current.add(sessionKey);
+      }
+      let payload = resolveQuickActionMessage(quickAction);
+      if (quickAction.id === "build_agent_identity" || quickAction.id === "build_user_profile") {
+        payload = `${INTERNAL_USER_PROMPT_PREFIX}\n${payload}`;
+        if (quickAction.id === "build_agent_identity") {
+          appendAssistantNotice(
+            "Agent Builder started. I will ask one focused question at a time to shape your agent.",
+            sessionKey
+          );
+        } else if (quickAction.id === "build_user_profile") {
+          appendAssistantNotice(
+            "Profile Builder started. I will ask one focused question at a time to build USER.md.",
+            sessionKey
+          );
+        }
+      }
+      void handleSend(payload);
+      return;
+    }
+
+    openQuickSuggestion(quickAction, sessionKey);
+  }
+
+  useEffect(() => {
+    if (!integrationSetup) return;
+    const onIntegrationUpdated = () => {
+      void verifyPendingIntegrationSetup();
+    };
+    window.addEventListener("entropic-integration-updated", onIntegrationUpdated);
+    return () => {
+      window.removeEventListener("entropic-integration-updated", onIntegrationUpdated);
+    };
+  }, [integrationSetup]);
 
   function handleChannelSetupComplete(channel: "imessage" | "whatsapp") {
     setChannelModal({ isOpen: false, channel });
     setChannelConfig((prev) => {
-      const next = prev ?? { imessageEnabled: false, whatsappEnabled: false };
+      const next = prev ?? {
+        imessageEnabled: false,
+        whatsappEnabled: false,
+        telegramEnabled: false,
+        telegramConnected: false,
+      };
       return channel === "imessage"
         ? { ...next, imessageEnabled: true }
         : { ...next, whatsappEnabled: true };
     });
     const channelName = channel === "imessage" ? "iMessage" : "WhatsApp";
     handleSend(`I've connected ${channelName}. Please send me a test message!`);
+  }
+
+  function handleTelegramSetupComplete() {
+    setTelegramSetupOpen(false);
+    setChannelConfig((prev) => ({
+      imessageEnabled: prev?.imessageEnabled ?? false,
+      whatsappEnabled: prev?.whatsappEnabled ?? false,
+      telegramEnabled: true,
+      telegramConnected: true,
+    }));
+    appendAssistantNotice("Telegram messaging is connected and ready in chat.");
   }
 
   type AssistantRenderPayload = ReturnType<typeof parseToolPayloads>;
@@ -2931,9 +3540,20 @@ export function Chat({
 
   const renderWelcome = () => {
     const userName = onboardingData?.userName || "there";
-    const hasName = userName !== "there";
-    const displayName = hasName ? userName : "My";
-    const suggestions = buildSuggestions(displayName, hasName);
+    const suggestions = getVisibleQuickActions({
+      telegramConnected: Boolean(channelConfig?.telegramConnected),
+    });
+    const builderSuggestions = suggestions.filter(
+      (suggestion) =>
+        suggestion.id === "build_agent_identity" || suggestion.id === "build_user_profile"
+    );
+    const secondarySuggestions = suggestions
+      .filter((suggestion) => !builderSuggestions.some((builder) => builder.id === suggestion.id))
+      .sort((a, b) => {
+        if (a.id === "inbox_cleanup") return -1;
+        if (b.id === "inbox_cleanup") return 1;
+        return 0;
+      });
 
     return (
       <div className="h-full flex flex-col items-center justify-center p-6 text-center">
@@ -2947,13 +3567,25 @@ export function Chat({
           <p className="text-[var(--text-secondary)] mb-8">
             What would you like me to help you with?
           </p>
-          <div className="flex flex-wrap justify-center gap-3">
-            {suggestions.map((suggestion, index) => (
+          <div className="flex flex-wrap justify-center gap-3 mb-3">
+            {builderSuggestions.map((suggestion, index) => (
               <SuggestionChip
-                key={index}
-                icon={suggestion.icon}
+                key={`builder-${index}`}
+                icon={QUICK_ACTION_ICONS[suggestion.icon]}
                 label={suggestion.label}
-                action={suggestion.action}
+                action={{ type: "quick_action", actionId: suggestion.id }}
+                onClick={handleSuggestionClick}
+                variant="builder"
+              />
+            ))}
+          </div>
+          <div className="flex flex-wrap justify-center gap-3">
+            {secondarySuggestions.map((suggestion, index) => (
+              <SuggestionChip
+                key={`secondary-${index}`}
+                icon={QUICK_ACTION_ICONS[suggestion.icon]}
+                label={suggestion.label}
+                action={{ type: "quick_action", actionId: suggestion.id }}
                 onClick={handleSuggestionClick}
               />
             ))}
@@ -3111,7 +3743,7 @@ export function Chat({
 
       {integrationsMissing && !integrationsSyncing && (
         <div className="p-2 text-center text-sm bg-amber-500/10 text-amber-700">
-          Integrations need reconnect — open Plugins to reconnect Google Calendar/Gmail.
+          Integrations need reconnect. Use a quick action below and complete reconnect in-chat.
         </div>
       )}
 
@@ -3218,6 +3850,8 @@ export function Chat({
               </div>
             );
           })}
+          {renderIntegrationSetupAssistantCard()}
+          {renderQuickSuggestionAssistantCard()}
           {isLoading && (
             <div className="flex justify-start">
               <div className="px-4 py-2.5 rounded-2xl bg-[var(--bg-tertiary)] flex items-center gap-2">
@@ -3239,27 +3873,29 @@ export function Chat({
           backdropFilter: 'blur(12px)',
           WebkitBackdropFilter: 'blur(12px)'
         }}>
-        <div className="max-w-3xl mx-auto flex items-end gap-2">
-          <textarea
-            ref={textareaRef}
-            value={activeDraft}
-            onFocus={() => {
-              ensureComposerSession();
-            }}
-            onChange={e => {
-              const sessionKey = currentSession || ensureComposerSession();
-              if (!sessionKey) return;
-              const nextValue = e.target.value;
-              setDraftsBySession((prev) => {
-                if ((prev[sessionKey] || "") === nextValue) return prev;
-                return { ...prev, [sessionKey]: nextValue };
-              });
-            }}
-            onKeyDown={e => {if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }}}
-            placeholder="Message your assistant..." rows={1}
-            className="form-input flex-1 resize-none leading-tight"
-          />
-          <button onClick={() => handleSend()} disabled={!activeDraft.trim() || isLoading} className="btn-primary !p-2.5 !bg-[var(--purple-accent)] hover:!bg-purple-700 text-white"><Send className="w-5 h-5" /></button>
+        <div className="max-w-3xl mx-auto space-y-3">
+          <div className="flex items-end gap-2">
+            <textarea
+              ref={textareaRef}
+              value={activeDraft}
+              onFocus={() => {
+                ensureComposerSession();
+              }}
+              onChange={e => {
+                const sessionKey = currentSession || ensureComposerSession();
+                if (!sessionKey) return;
+                const nextValue = e.target.value;
+                setDraftsBySession((prev) => {
+                  if ((prev[sessionKey] || "") === nextValue) return prev;
+                  return { ...prev, [sessionKey]: nextValue };
+                });
+              }}
+              onKeyDown={e => {if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }}}
+              placeholder="Message your assistant..." rows={1}
+              className="form-input flex-1 resize-none leading-tight"
+            />
+            <button onClick={() => handleSend()} disabled={!activeDraft.trim() || isLoading} className="btn-primary !p-2.5 !bg-[var(--purple-accent)] hover:!bg-purple-700 text-white"><Send className="w-5 h-5" /></button>
+          </div>
         </div>
         {dragActive && (
           <div className="absolute inset-0 bg-black/10 border-2 border-dashed border-white/50 flex items-center justify-center font-medium text-white">
@@ -3334,6 +3970,11 @@ export function Chat({
         isOpen={channelModal.isOpen}
         onClose={() => setChannelModal({ ...channelModal, isOpen: false })}
         onSetupComplete={handleChannelSetupComplete}
+      />
+      <TelegramSetupModal
+        isOpen={telegramSetupOpen}
+        onClose={() => setTelegramSetupOpen(false)}
+        onSetupComplete={handleTelegramSetupComplete}
       />
     </div>
   );

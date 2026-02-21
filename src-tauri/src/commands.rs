@@ -1860,6 +1860,8 @@ pub struct GatewayConfigHealth {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AgentProfileState {
     pub soul: String,
+    pub identity_name: String,
+    pub identity_avatar: Option<String>,
     pub heartbeat_every: String,
     pub heartbeat_tasks: Vec<String>,
     pub memory_enabled: bool,
@@ -2467,6 +2469,20 @@ fn workspace_file(path: &str) -> String {
     } else {
         format!("{}/{}", WORKSPACE_ROOT, trimmed)
     }
+}
+
+fn parse_markdown_bold_field(content: &str, field: &str) -> Option<String> {
+    let prefix = format!("- **{}:**", field);
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            let value = rest.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn state_file(path: &str) -> String {
@@ -4305,7 +4321,7 @@ Use it for durable decisions, preferences, and facts that should persist across 
         ContainerFileWrite {
             path: &identity_path,
             content: &id_body,
-            only_if_missing: false,
+            only_if_missing: true,
         },
         ContainerFileWrite {
             path: &memory_path,
@@ -7657,6 +7673,19 @@ pub async fn get_gateway_auth(app: AppHandle) -> Result<GatewayAuthPayload, Stri
 pub async fn get_agent_profile_state(app: AppHandle) -> Result<AgentProfileState, String> {
     let stored = load_agent_settings(&app);
     let soul = read_container_file(&workspace_file("SOUL.md")).unwrap_or_default();
+    let identity_raw = read_container_file(&workspace_file("IDENTITY.md")).unwrap_or_default();
+    let identity_name = parse_markdown_bold_field(&identity_raw, "Name")
+        .unwrap_or_else(|| stored.identity_name.clone());
+    let identity_avatar = parse_markdown_bold_field(&identity_raw, "Avatar")
+        .or_else(|| stored.identity_avatar.clone())
+        .and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
     let heartbeat_raw = read_container_file(&workspace_file("HEARTBEAT.md")).unwrap_or_default();
     let heartbeat_tasks = heartbeat_raw
         .lines()
@@ -7936,6 +7965,8 @@ pub async fn get_agent_profile_state(app: AppHandle) -> Result<AgentProfileState
         } else {
             soul
         },
+        identity_name,
+        identity_avatar,
         heartbeat_every,
         heartbeat_tasks: final_tasks,
         memory_enabled,
@@ -8191,17 +8222,42 @@ pub async fn set_identity(
     name: String,
     avatar_data_url: Option<String>,
 ) -> Result<(), String> {
+    let existing = read_container_file(&workspace_file("IDENTITY.md")).unwrap_or_default();
+    let stored = load_agent_settings(&app);
+    let next_name = {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            trimmed.to_string()
+        } else {
+            parse_markdown_bold_field(&existing, "Name")
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    let fallback = stored.identity_name.trim();
+                    if fallback.is_empty() {
+                        None
+                    } else {
+                        Some(fallback.to_string())
+                    }
+                })
+                .unwrap_or_else(|| "Entropic".to_string())
+        }
+    };
+    let creature = parse_markdown_bold_field(&existing, "Creature").unwrap_or_default();
+    let vibe = parse_markdown_bold_field(&existing, "Vibe").unwrap_or_default();
+    let emoji = parse_markdown_bold_field(&existing, "Emoji").unwrap_or_default();
     let mut body = String::from("# IDENTITY.md - Who Am I?\n\n");
-    body.push_str(&format!("- **Name:** {}\n", name.trim()));
-    body.push_str("- **Creature:**\n- **Vibe:**\n- **Emoji:**\n");
+    body.push_str(&format!("- **Name:** {}\n", next_name));
+    body.push_str(&format!("- **Creature:** {}\n", creature));
+    body.push_str(&format!("- **Vibe:** {}\n", vibe));
+    body.push_str(&format!("- **Emoji:** {}\n", emoji));
     if let Some(ref url) = avatar_data_url {
         body.push_str(&format!("- **Avatar:** {}\n", url));
     } else {
         body.push_str("- **Avatar:**\n");
     }
     write_container_file(&workspace_file("IDENTITY.md"), &body)?;
-    let mut settings = load_agent_settings(&app);
-    settings.identity_name = name.trim().to_string();
+    let mut settings = stored;
+    settings.identity_name = next_name;
     settings.identity_avatar = avatar_data_url;
     save_agent_settings(&app, settings)?;
     Ok(())
