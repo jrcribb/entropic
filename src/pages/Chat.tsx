@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback, type ComponentType, type FormEvent } from "react";
 import {
   Send,
+  Paperclip,
   Sparkles,
   X,
   Loader2,
@@ -76,7 +77,13 @@ export type ChatSessionActionRequest =
   | { id: string; type: "pin"; key: string; pinned: boolean }
   | { id: string; type: "rename"; key: string; label: string };
 type Provider = { id: string; name: string; icon: string; placeholder: string; keyUrl: string };
-type PendingAttachment = { id: string; fileName: string; tempPath: string; savedPath?: string };
+type PendingAttachment = {
+  id: string;
+  fileName: string;
+  mimeType: string;
+  content: string;
+  previewUrl?: string;
+};
 type AuthState = { active_provider: string | null; providers: Array<{ id: string; has_key: boolean }> };
 type CalendarEvent = { id?: string; summary?: string; start?: string; end?: string; attendees?: Array<{ email?: string; displayName?: string }> };
 type ToolError = { tool?: string; error?: string; status?: string };
@@ -940,6 +947,8 @@ const PROVIDERS: Provider[] = [
 const DEFAULT_GATEWAY_URL = "ws://localhost:19789";
 const HISTORY_LIMIT = 500;
 const ACTIVE_RUN_IDLE_TIMEOUT_MS = 120_000;
+const MAX_IMAGE_ATTACHMENTS_PER_MESSAGE = 4;
+const MAX_IMAGE_ATTACHMENT_BYTES = 5_000_000;
 const UI_SESSION_KEY_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CHANNEL_SESSION_KEY_MARKERS = [
@@ -1135,6 +1144,7 @@ export function Chat({
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const clientRef = useRef<GatewayClient | null>(null);
   const connectInFlightRef = useRef(false);
   const currentSessionRef = useRef<string | null>(null);
@@ -1197,6 +1207,79 @@ export function Chat({
         detail: { source: "chat-credits" },
       })
     );
+  }
+
+  function stripDataUrlPrefix(value: string): string {
+    const match = /^data:[^;]+;base64,(.*)$/i.exec(value);
+    return match ? match[1] : value;
+  }
+
+  function readFileAsDataUrl(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error(`Failed to read file: ${file.name}`));
+      reader.onload = () => {
+        if (typeof reader.result === "string") {
+          resolve(reader.result);
+        } else {
+          reject(new Error(`Failed to read file: ${file.name}`));
+        }
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function addImageAttachments(filesInput: FileList | File[] | null | undefined) {
+    const files = filesInput ? Array.from(filesInput) : [];
+    if (files.length === 0) return;
+
+    const imageFiles = files.filter((file) => file.type.startsWith("image/"));
+    if (imageFiles.length === 0) {
+      setError("Only image attachments are supported right now.");
+      return;
+    }
+
+    const remainingSlots = Math.max(0, MAX_IMAGE_ATTACHMENTS_PER_MESSAGE - pendingAttachments.length);
+    if (remainingSlots <= 0) {
+      setError(`You can attach up to ${MAX_IMAGE_ATTACHMENTS_PER_MESSAGE} images per message.`);
+      return;
+    }
+
+    const selectedFiles = imageFiles.slice(0, remainingSlots);
+    if (imageFiles.length > remainingSlots) {
+      setError(`You can attach up to ${MAX_IMAGE_ATTACHMENTS_PER_MESSAGE} images per message.`);
+    } else {
+      setError(null);
+    }
+
+    const nextAttachments: PendingAttachment[] = [];
+    for (const file of selectedFiles) {
+      if (file.size > MAX_IMAGE_ATTACHMENT_BYTES) {
+        setError(`${file.name} is too large. Max size is 5 MB per image.`);
+        continue;
+      }
+      try {
+        const dataUrl = await readFileAsDataUrl(file);
+        const base64 = stripDataUrlPrefix(dataUrl);
+        nextAttachments.push({
+          id: crypto.randomUUID(),
+          fileName: file.name,
+          mimeType: file.type || "image/png",
+          content: base64,
+          previewUrl: dataUrl,
+        });
+      } catch (err) {
+        setError(err instanceof Error ? err.message : `Failed to attach ${file.name}.`);
+      }
+    }
+
+    if (nextAttachments.length > 0) {
+      setPendingAttachments((prev) => [...prev, ...nextAttachments]);
+    }
+  }
+
+  function removePendingAttachment(attachmentId: string) {
+    setPendingAttachments((prev) => prev.filter((attachment) => attachment.id !== attachmentId));
   }
 
   async function handleQuickAddCredits() {
@@ -2612,6 +2695,16 @@ export function Chat({
     const messageContent = content || currentDraft.trim();
     const failedDraftRestore = content ? null : currentDraft;
     if (!sendSession || isLoading || (!messageContent && pendingAttachments.length === 0)) return;
+    const attachmentsPayload = pendingAttachments.map((attachment) => ({
+      fileName: attachment.fileName,
+      mimeType: attachment.mimeType,
+      content: attachment.content,
+    }));
+    const userVisibleContent =
+      messageContent ||
+      (pendingAttachments.length === 1
+        ? `[Attached image: ${pendingAttachments[0]?.fileName || "image"}]`
+        : `[Attached ${pendingAttachments.length} images]`);
     const liveClient = clientRef.current;
     if (!liveClient || !liveClient.isConnected()) {
       if (!connectInFlightRef.current) {
@@ -2627,7 +2720,12 @@ export function Chat({
 
     await refreshTrialCredits();
 
-    const userMessage: Message = { id: crypto.randomUUID(), role: "user", content: messageContent, sentAt: Date.now() };
+    const userMessage: Message = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content: userVisibleContent,
+      sentAt: Date.now(),
+    };
     visibleMessagesSessionRef.current = sendSession;
     setMessages(prev => [...prev, userMessage]);
 
@@ -2693,7 +2791,7 @@ export function Chat({
         );
       }
       addDiag(`send -> session=${sendSession} len=${messageContent.length}`);
-      const runId = await liveClient.sendMessage(sendSession, messageContent, []);
+      const runId = await liveClient.sendMessage(sendSession, messageContent, attachmentsPayload);
       if (!runId) {
         throw new Error("Failed to start response stream");
       }
@@ -3169,7 +3267,7 @@ export function Chat({
         payload = `${INTERNAL_USER_PROMPT_PREFIX}\n${payload}`;
         if (quickAction.id === "build_agent_identity") {
           appendAssistantNotice(
-            "Agent Builder started. I will ask one focused question at a time to shape your agent.",
+            "Agent Builder started. I will ask one focused question at a time to shape your agent. We will start with your agent name and profile picture, then confirm identity details.",
             sessionKey
           );
         } else if (quickAction.id === "build_user_profile") {
@@ -3720,12 +3818,23 @@ export function Chat({
     error && isBillingIssueMessage(error) && !isAuthenticated && isAuthConfigured
   );
 
-  const chatAgentName = agentProfile?.name || onboardingData?.agentName || "Nova";
+  const chatAgentName = agentProfile?.name || onboardingData?.agentName || "Joulie";
 
   // Main Chat UI
   return (
-    <div className="h-full flex flex-col bg-transparent" onDragOver={e => { e.preventDefault(); setDragActive(true); }}
-      onDragLeave={() => setDragActive(false)} onDrop={e => { e.preventDefault(); setDragActive(false); }}>
+    <div
+      className="h-full flex flex-col bg-transparent"
+      onDragOver={(event) => {
+        event.preventDefault();
+        setDragActive(true);
+      }}
+      onDragLeave={() => setDragActive(false)}
+      onDrop={(event) => {
+        event.preventDefault();
+        setDragActive(false);
+        void addImageAttachments(event.dataTransfer?.files);
+      }}
+    >
 
       {integrationsSyncing ? (
         <div className="flex-shrink-0" style={{
@@ -3886,7 +3995,57 @@ export function Chat({
           WebkitBackdropFilter: 'blur(12px)'
         }}>
         <div className="max-w-3xl mx-auto space-y-3">
+          {pendingAttachments.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {pendingAttachments.map((attachment) => (
+                <div
+                  key={attachment.id}
+                  className="flex items-center gap-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-tertiary)] px-2 py-1.5"
+                >
+                  {attachment.previewUrl ? (
+                    <img
+                      src={attachment.previewUrl}
+                      alt={attachment.fileName}
+                      className="w-8 h-8 rounded object-cover"
+                    />
+                  ) : (
+                    <div className="w-8 h-8 rounded bg-black/5" />
+                  )}
+                  <span className="text-xs text-[var(--text-secondary)] max-w-[180px] truncate">
+                    {attachment.fileName}
+                  </span>
+                  <button
+                    onClick={() => removePendingAttachment(attachment.id)}
+                    className="p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+                    aria-label={`Remove ${attachment.fileName}`}
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            multiple
+            className="hidden"
+            onChange={(event) => {
+              void addImageAttachments(event.target.files);
+              event.currentTarget.value = "";
+            }}
+          />
           <div className="flex items-end gap-2">
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isLoading}
+              className="btn-secondary !p-2.5"
+              title="Attach image"
+              aria-label="Attach image"
+            >
+              <Paperclip className="w-4 h-4" />
+            </button>
             <textarea
               ref={textareaRef}
               value={activeDraft}
@@ -3906,7 +4065,13 @@ export function Chat({
               placeholder="Message your assistant..." rows={1}
               className="form-input flex-1 resize-none leading-tight"
             />
-            <button onClick={() => handleSend()} disabled={!activeDraft.trim() || isLoading} className="btn-primary !p-2.5 !bg-[var(--purple-accent)] hover:!bg-purple-700 text-white"><Send className="w-5 h-5" /></button>
+            <button
+              onClick={() => handleSend()}
+              disabled={(!activeDraft.trim() && pendingAttachments.length === 0) || isLoading}
+              className="btn-primary !p-2.5 !bg-[var(--purple-accent)] hover:!bg-purple-700 text-white"
+            >
+              <Send className="w-5 h-5" />
+            </button>
           </div>
         </div>
         {dragActive && (

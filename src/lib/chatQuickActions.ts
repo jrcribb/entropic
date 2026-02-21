@@ -60,35 +60,35 @@ const CHAT_QUICK_ACTIONS: ChatQuickActionDefinition[] = [
 Read existing SOUL.md and HEARTBEAT.md quietly if they exist.
 Read existing USER.md quietly if it exists.
 Read existing IDENTITY.md quietly if it exists.
-Before anything else, confirm the human profile context:
-- name
-- what to call them
-- timezone
-If USER.md is missing/incomplete, collect missing fields first.
+Start with agent identity first. Ask these first:
+1) "What should your agent be called?"
+2) "Do you want to upload a profile picture now, or have me generate options?"
 
-If SOUL.md exists, first ask if we should refine it or replace it.
+If they choose upload, ask them to attach an image in chat and wait for it.
+If they choose generation, propose 3 distinct avatar concepts and ask them to approve one.
+Do not finalize avatar changes until they explicitly approve.
+
+Always replace SOUL.md entirely in this flow.
+Do not ask whether to refine SOUL.md or replace it.
 If IDENTITY.md exists, keep what still fits and only replace parts I ask to change.
+
+Do not run full USER.md interview questions here (name/career/goals/ambitions/timezone).
+Those belong in "Build my profile". Use USER.md as context if available.
 
 Ask exactly one short, targeted question at a time (max two lines), then wait.
 Collect:
-- interests
-- career
-- goals
-- ambitions
-- personal context the assistant should know
 - identity details:
   - agent name
   - creature
   - vibe
   - emoji
   - avatar preference
+- mission statement
+- core truths
+- boundaries
+- continuity and working style
 
-Help craft a one-sentence mission statement (north star) based on goals and ambitions.
-
-For avatar setup:
-- Ask if I want to upload an avatar image or have you generate one.
-- If I choose generation, propose 3 distinct random avatar concepts and ask me to approve one.
-- Do not finalize avatar changes until I explicitly approve.
+Help craft a one-sentence mission statement (north star) based on USER.md context and this identity flow.
 
 Then propose concise drafts:
 1) SOUL.md with:
