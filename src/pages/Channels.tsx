@@ -152,6 +152,8 @@ export function Channels() {
       }
     }, 8000);
     const loadInitialState = async () => {
+      let telegramEnabledLoaded = false;
+      let telegramTokenLoaded = "";
       try {
         const state = await invoke<{
           telegram_enabled: boolean;
@@ -165,8 +167,10 @@ export function Channels() {
         }>("get_agent_profile_state");
         if (cancelled) return;
 
-        setTelegramEnabled(state.telegram_enabled ?? false);
-        setTelegramToken(state.telegram_token || "");
+        telegramEnabledLoaded = state.telegram_enabled ?? false;
+        telegramTokenLoaded = state.telegram_token || "";
+        setTelegramEnabled(telegramEnabledLoaded);
+        setTelegramToken(telegramTokenLoaded);
         const dmPolicy = normalizeTelegramDmPolicy(state.telegram_dm_policy);
         const groupPolicy = normalizeTelegramGroupPolicy(state.telegram_group_policy);
         const configWrites = state.telegram_config_writes ?? false;
@@ -179,14 +183,14 @@ export function Channels() {
         setTelegramRequireMention(requireMention);
         setTelegramReplyToMode(replyToMode);
         setTelegramLinkPreview(linkPreview);
-        setTelegramTokenSaved(Boolean(state.telegram_token?.trim()));
+        setTelegramTokenSaved(Boolean(telegramTokenLoaded.trim()));
 
         // Auto-configure runtime if Telegram is enabled with a token.
-        if (state.telegram_enabled && state.telegram_token?.trim()) {
+        if (telegramEnabledLoaded && telegramTokenLoaded.trim()) {
           console.log("[Channels] Auto-configuring Telegram on startup");
           void autoConfigureTelegram({
-            enabled: state.telegram_enabled,
-            token: state.telegram_token,
+            enabled: telegramEnabledLoaded,
+            token: telegramTokenLoaded,
             dmPolicy,
             groupPolicy,
             configWrites,
@@ -205,7 +209,7 @@ export function Channels() {
         void refreshGatewayRunningStatus();
 
         // Send welcome message if already connected on startup
-        if (isConnected && state.telegram_enabled && state.telegram_token?.trim()) {
+        if (isConnected && telegramEnabledLoaded && telegramTokenLoaded.trim()) {
           console.log("[Channels] Already connected on startup, sending welcome message...");
           invoke("send_telegram_welcome_message").catch((err) => {
             console.error("[Channels] Failed to send welcome message:", err);
