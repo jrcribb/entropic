@@ -644,6 +644,13 @@ export function Store({
 
   async function handleDisconnectIntegration(provider: IntegrationProvider) {
     setConnecting(provider);
+    setIntegrations((prev) =>
+      prev.map((integration) =>
+        integration.provider === provider
+          ? { ...integration, connected: false, stale: true }
+          : integration
+      )
+    );
     try {
       await disconnectIntegration(provider);
       try {
@@ -959,33 +966,46 @@ export function Store({
                   Google Workspace
                 </h2>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {googleIntegrations.map((integration) => (
-                    <div key={integration.id} className="bg-white rounded-xl p-4 shadow-sm border border-[var(--border-subtle)] flex items-center justify-between">
-                      <div className="flex items-center gap-4">
-                        <div className="w-12 h-12 rounded-xl bg-[var(--system-gray-6)] border border-[var(--border-subtle)] flex items-center justify-center">
-                          <integration.icon className="w-7 h-7" />
-                        </div>
-                        <div>
-                          <div className="font-semibold text-[var(--text-primary)] text-sm">{integration.name}</div>
-                          <div className="text-xs text-[var(--text-secondary)]">
-                            {integration.email || integration.description}
+                  {googleIntegrations.map((integration) => {
+                    const effectivelyConnected = integration.connected && !integration.stale;
+                    return (
+                      <div key={integration.id} className="bg-white rounded-xl p-4 shadow-sm border border-[var(--border-subtle)] flex items-center justify-between">
+                        <div className="flex items-center gap-4">
+                          <div className="w-12 h-12 rounded-xl bg-[var(--system-gray-6)] border border-[var(--border-subtle)] flex items-center justify-center">
+                            <integration.icon className="w-7 h-7" />
+                          </div>
+                          <div>
+                            <div className="font-semibold text-[var(--text-primary)] text-sm">{integration.name}</div>
+                            <div className="text-xs text-[var(--text-secondary)]">
+                              {integration.email || integration.description}
+                            </div>
                           </div>
                         </div>
+                        <button
+                          onClick={() =>
+                            effectivelyConnected
+                              ? handleDisconnectIntegration(integration.id)
+                              : handleConnectIntegration(integration.id)
+                          }
+                          disabled={connecting === integration.id}
+                          className={clsx(
+                            "px-4 py-1.5 rounded-full text-[11px] font-semibold uppercase tracking-wide transition-all",
+                            effectivelyConnected
+                              ? "bg-[var(--system-gray-6)] text-[var(--text-secondary)] hover:bg-red-50 hover:text-red-600"
+                              : "bg-[var(--system-blue)] text-white hover:opacity-90"
+                          )}
+                        >
+                          {connecting === integration.id
+                            ? "..."
+                            : effectivelyConnected
+                              ? "Disconnect"
+                              : integration.connected && integration.stale
+                                ? "Reconnect"
+                                : "Connect"}
+                        </button>
                       </div>
-                      <button
-                        onClick={() => integration.connected && !integration.stale ? handleDisconnectIntegration(integration.id) : handleConnectIntegration(integration.id)}
-                        disabled={connecting === integration.id}
-                        className={clsx(
-                          "px-4 py-1.5 rounded-full text-[11px] font-semibold uppercase tracking-wide transition-all",
-                          integration.connected && !integration.stale
-                            ? "bg-[var(--system-gray-6)] text-[var(--text-secondary)] hover:bg-red-50 hover:text-red-600"
-                            : "bg-[var(--system-blue)] text-white hover:opacity-90"
-                        )}
-                      >
-                        {connecting === integration.id ? "..." : integration.connected ? "Disconnect" : "Connect"}
-                      </button>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -1100,6 +1120,15 @@ export function Store({
                     ? { label: "Managed", className: "bg-blue-50 text-blue-600 border-blue-100" }
                     : scanBadge(skillScanResults[skill.id] || null);
                   const Icon = skill.pluginId ? PLUGIN_ICONS[skill.pluginId] : null;
+                  const integrationEntry = skill.integrationProvider
+                    ? integrations.find((entry) => entry.provider === skill.integrationProvider)
+                    : null;
+                  const integrationConnected = Boolean(
+                    skill.integrationProvider &&
+                    integrationEntry &&
+                    integrationEntry.connected &&
+                    !integrationEntry.stale
+                  );
 
                   return (
                     <div key={skill.id} className="bg-white rounded-xl p-4 shadow-sm border border-[var(--border-subtle)] hover:shadow-md transition-all duration-300 flex flex-col">
@@ -1131,14 +1160,26 @@ export function Store({
                         )}
                         {skill.integrationProvider ? (
                           <button
-                            onClick={() => skill.connected ? handleDisconnectIntegration(skill.integrationProvider as IntegrationProvider) : handleConnectIntegration(skill.integrationProvider as IntegrationProvider)}
+                            onClick={() =>
+                              integrationConnected
+                                ? handleDisconnectIntegration(skill.integrationProvider as IntegrationProvider)
+                                : handleConnectIntegration(skill.integrationProvider as IntegrationProvider)
+                            }
                             disabled={connecting === skill.integrationProvider}
                             className={clsx(
                               "w-full py-2 rounded-xl text-xs font-bold uppercase tracking-widest transition-all",
-                              skill.connected ? "bg-green-50 text-green-600" : "bg-blue-600 text-white shadow-lg shadow-blue-100"
+                              integrationConnected
+                                ? "bg-green-50 text-green-600"
+                                : "bg-blue-600 text-white shadow-lg shadow-blue-100"
                             )}
                           >
-                            {connecting === skill.integrationProvider ? "..." : skill.connected ? "Connected" : "Setup"}
+                            {connecting === skill.integrationProvider
+                              ? "..."
+                              : integrationConnected
+                                ? "Connected"
+                                : integrationEntry?.connected && integrationEntry.stale
+                                  ? "Reconnect"
+                                  : "Setup"}
                           </button>
                         ) : skill.workspaceSkillId ? (
                           <button
