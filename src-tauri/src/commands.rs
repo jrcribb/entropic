@@ -7144,22 +7144,31 @@ pub async fn cleanup_app_data(app: AppHandle, include_vms: bool) -> Result<Strin
         }
     }
 
-    // Clear app data (but keep auth.json with user's preferences)
-    cleanup_log.push("Cleaning up app cache...".to_string());
-    if let Some(app_data_dir) = app.path().app_data_dir().ok() {
-        // Remove specific files/dirs but keep auth.json
-        let items_to_remove = vec!["logs", "cache", "tmp"];
-        for item in items_to_remove {
-            let path = app_data_dir.join(item);
-            if path.exists() {
-                let _ = if path.is_dir() {
-                    fs::remove_dir_all(&path)
-                } else {
-                    fs::remove_file(&path)
-                };
+    // Full cleanup: remove ALL app data, caches, and stores (chat history, settings, etc.)
+    // Mirrors: rm -rf ~/Library/Application Support/ai.openclaw.entropic{,.dev}
+    //                  ~/Library/Caches/entropic{,-dev}
+    //                  ~/.cache/entropic
+    cleanup_log.push("Cleaning up all app data and caches...".to_string());
+    let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
+    let dirs_to_remove = vec![
+        // App data (Tauri stores: chat history, settings, auth)
+        home_dir.join("Library/Application Support/ai.openclaw.entropic"),
+        home_dir.join("Library/Application Support/ai.openclaw.entropic.dev"),
+        // App caches
+        home_dir.join("Library/Caches/entropic"),
+        home_dir.join("Library/Caches/entropic-dev"),
+        home_dir.join(".cache/entropic"),
+    ];
+    for dir in &dirs_to_remove {
+        if dir.exists() {
+            if let Err(e) = fs::remove_dir_all(dir) {
+                cleanup_log.push(format!(
+                    "Warning: Failed to remove {}: {}", dir.display(), e
+                ));
+            } else {
+                cleanup_log.push(format!("Removed {}", dir.display()));
             }
         }
-        cleanup_log.push("App cache cleared".to_string());
     }
 
     cleanup_log.push("Cleanup completed successfully!".to_string());

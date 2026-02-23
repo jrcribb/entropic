@@ -1262,12 +1262,12 @@ export function Settings({
             <div className="flex-1">
               <div className="text-[14px] font-medium text-[var(--text-primary)] mb-1">Reset Application</div>
               <div className="text-[12px] text-[var(--text-secondary)] mb-3">
-                Clean up Entropic + legacy Nova Colima VMs, Docker containers, volumes, and app cache. Your auth settings will be preserved.
+                Fully reset Entropic: removes all chat history, settings, Colima VMs, Docker containers, volumes, and caches.
               </div>
               <button
                 onClick={async () => {
                   console.log("[Settings] Reset Application clicked");
-                  const confirmed = await ask("Are you sure you want to reset the application? This also removes legacy Nova runtime data.", {
+                  const confirmed = await ask("Are you sure you want to fully reset? This removes all chat history, settings, VMs, containers, and caches.", {
                     title: "Reset Application",
                     kind: "warning",
                     okLabel: "Reset",

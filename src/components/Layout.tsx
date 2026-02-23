@@ -63,7 +63,7 @@ const baseNavItems: { id: Page; label: string; icon: typeof MessageSquare }[] = 
   { id: "chat", label: "New Chat", icon: Plus },
   { id: "files", label: "Desktop", icon: FolderOpen },
   { id: "channels", label: "Messaging", icon: Radio },
-  { id: "store", label: "Integrations", icon: Puzzle },
+  // { id: "store", label: "Integrations", icon: Puzzle },
   { id: "skills", label: "Skills", icon: Sparkles },
   { id: "tasks", label: "Tasks", icon: CalendarClock },
   { id: "billing", label: "Billing", icon: CreditCard },

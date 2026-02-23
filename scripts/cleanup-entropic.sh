@@ -15,7 +15,7 @@ echo "  • Docker containers and volumes"
 echo "  • Application cache and state"
 echo "  • Runtime binaries and configuration"
 echo ""
-echo "Your settings in ~/Library/Application Support/ai.openclaw.entropic will be preserved."
+echo "All app data (chat history, settings, caches) will be removed."
 echo ""
 read -p "Continue? (y/N) " -n 1 -r
 echo
@@ -97,15 +97,21 @@ for runtime_dir in "$HOME/.nova" "$HOME/.entropic"; do
     fi
 done
 
-# Clean app cache (but preserve settings)
-echo "→ Cleaning application cache..."
-APP_SUPPORT="$HOME/Library/Application Support/ai.openclaw.entropic"
-if [ -d "$APP_SUPPORT" ]; then
-    rm -rf "$APP_SUPPORT/logs" "$APP_SUPPORT/cache" "$APP_SUPPORT/tmp" 2>/dev/null || true
-    echo "  ✓ Cache cleaned (settings preserved)"
-else
-    echo "  ⊘ App support directory not found"
-fi
+# Clean ALL app data (chat history, settings, caches — full reset)
+echo "→ Removing all app data and caches..."
+for dir in \
+    "$HOME/Library/Application Support/ai.openclaw.entropic" \
+    "$HOME/Library/Application Support/ai.openclaw.entropic.dev" \
+    "$HOME/Library/Caches/entropic" \
+    "$HOME/Library/Caches/entropic-dev" \
+    "$HOME/.cache/entropic"; do
+    if [ -d "$dir" ]; then
+        rm -rf "$dir"
+        echo "  ✓ Removed $dir"
+    else
+        echo "  ⊘ $dir not found"
+    fi
+done
 
 # Clean Docker contexts
 echo "→ Cleaning Docker contexts..."
@@ -123,7 +129,7 @@ echo "║        Cleanup Complete! ✓             ║"
 echo "╚════════════════════════════════════════╝"
 echo ""
 echo "Entropic has been reset to a clean state."
-echo "Your settings in $APP_SUPPORT have been preserved."
+echo "All app data, caches, and settings have been removed."
 echo ""
 echo "You can now:"
 echo "  • Reinstall Entropic"
