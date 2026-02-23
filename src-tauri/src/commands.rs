@@ -3728,12 +3728,32 @@ async fn scan_directory_with_scanner(scanner_dir: &str) -> Result<PluginScanResu
         format!("http://127.0.0.1:{}/scan", SCANNER_HOST_PORT)
     };
 
-    let res = client
-        .post(&scan_url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Scan request failed: {}", e))?;
+    // Retry with backoff when the scanner container is still starting up.
+    let mut last_err = String::new();
+    let mut res_ok = None;
+    for attempt in 0u32..6 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt))).await;
+        }
+        match client.post(&scan_url).json(&body).send().await {
+            Ok(r) => {
+                res_ok = Some(r);
+                break;
+            }
+            Err(e) => {
+                last_err = format!("{}", e);
+                let is_connect = e.is_connect() || e.is_request()
+                    || last_err.contains("connection closed")
+                    || last_err.contains("Connection refused");
+                if !is_connect {
+                    return Err(format!("Scan request failed: {}", e));
+                }
+            }
+        }
+    }
+    let res = res_ok.ok_or_else(|| {
+        format!("Scan request failed after retries (scanner may not be ready): {}", last_err)
+    })?;
 
     if !res.status().is_success() {
         let status = res.status();

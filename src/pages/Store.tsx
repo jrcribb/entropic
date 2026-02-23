@@ -313,6 +313,7 @@ export function Store({
   const [skillScanResults, setSkillScanResults] = useState<Record<string, PluginScanResult>>({});
   const [gatewayRestarting, setGatewayRestarting] = useState(false);
   const syncedIntegrationsRef = useRef<Set<string>>(new Set());
+  const [justInstalledSlugs, setJustInstalledSlugs] = useState<Set<string>>(new Set());
 
   // Redesign state - sub-tab removed, single unified view
 
@@ -667,17 +668,22 @@ export function Store({
     setClawhubError(null);
     setPendingUnsafeSlug(null);
 
+    // Open the scan modal immediately so the user sees scanning progress
+    setScanIntent("skill-audit");
+    setScanTargetName((targetName || normalizedSlug).trim() || normalizedSlug);
+    setScanPluginId(null);
+    setScanResult(null);
+    setScanError(null);
+    setIsScanning(true);
+    setScanModalOpen(true);
+
     try {
       const result = await invoke<ClawhubInstallResult>("scan_and_install_clawhub_skill", {
         slug: normalizedSlug,
         allowUnsafe,
       });
-      setScanIntent("skill-audit");
-      setScanTargetName((targetName || normalizedSlug).trim() || normalizedSlug);
-      setScanPluginId(null);
+      setIsScanning(false);
       setScanResult(result.scan);
-      setScanError(null);
-      setScanModalOpen(true);
       setSkillScanResults((prev) => ({ ...prev, [result.installed_skill_id || normalizedSlug]: result.scan }));
       if (result.blocked && !allowUnsafe) {
         setPendingUnsafeSlug(normalizedSlug);
@@ -685,6 +691,7 @@ export function Store({
         setPendingUnsafeSlug(null);
       }
       if (result.installed) {
+        setJustInstalledSlugs((prev) => new Set(prev).add(normalizedSlug));
         await refreshSkills();
         await refreshClawhubCatalog({ silent: true });
       } else if (result.message) {
@@ -692,9 +699,9 @@ export function Store({
       }
     } catch (err) {
       const msg = String(err);
+      setIsScanning(false);
       setClawhubError(msg);
       setScanError(msg);
-      setScanModalOpen(true);
     } finally {
       setClawhubBusy(false);
       setClawhubBusySlug(null);
@@ -709,6 +716,11 @@ export function Store({
     setSkillsError(null);
     try {
       await invoke("remove_workspace_skill", { id: skillId });
+      setJustInstalledSlugs((prev) => {
+        const next = new Set(prev);
+        next.delete(skillId);
+        return next;
+      });
       setSkillScanResults((prev) => {
         const next = { ...prev };
         delete next[skillId];
@@ -844,11 +856,11 @@ export function Store({
     ? clawhubCatalog.find((skill) => skill.slug === clawhubDetailModalSlug) ?? clawhubDetailModalSkill
     : clawhubDetailModalSkill;
   const activeClawhubDetails = clawhubDetailModalSlug ? clawhubDetails[clawhubDetailModalSlug] : null;
-  const activeClawhubInstalled = clawhubDetailModalSlug ? installedWorkspaceSkillIds.has(clawhubDetailModalSlug) : false;
+  const activeClawhubInstalled = clawhubDetailModalSlug ? (installedWorkspaceSkillIds.has(clawhubDetailModalSlug) || justInstalledSlugs.has(clawhubDetailModalSlug)) : false;
   const activeClawhubBusy = !!(clawhubDetailModalSlug && clawhubBusy && clawhubBusySlug === clawhubDetailModalSlug);
 
   function renderClawhubSkillCard(skill: ClawhubCatalogSkill) {
-    const installed = installedWorkspaceSkillIds.has(skill.slug);
+    const installed = installedWorkspaceSkillIds.has(skill.slug) || justInstalledSlugs.has(skill.slug);
 
     return (
       <div key={skill.slug} className="group bg-white rounded-xl p-4 shadow-sm border border-[var(--border-subtle)] hover:shadow-md transition-all duration-300 flex flex-col h-full">
@@ -874,17 +886,24 @@ export function Store({
               onClick={() => scanInstallSkillFromClawhub(skill.slug, false, skill.display_name || skill.slug)}
               disabled={clawhubBusy || installed}
               className={clsx(
-                "px-4 py-1.5 rounded-full text-[11px] font-semibold transition-all uppercase tracking-wide",
+                "px-4 py-1.5 rounded-full text-[11px] font-semibold uppercase tracking-wide inline-flex items-center gap-1.5",
                 installed
                   ? "bg-[var(--system-gray-6)] text-[var(--text-tertiary)] cursor-default"
-                  : "bg-[var(--system-blue)] text-white shadow-md shadow-blue-100 hover:brightness-95"
+                  : clawhubBusySlug === skill.slug
+                    ? "bg-[var(--system-blue)]/80 text-white"
+                    : "bg-[var(--system-blue)] text-white shadow-md shadow-blue-100 hover:brightness-95"
               )}
             >
-              {installed
-                ? "Installed"
-                : clawhubBusy && clawhubBusySlug === skill.slug
-                  ? "..."
-                  : "Install"}
+              {installed ? (
+                "Installed"
+              ) : clawhubBusySlug === skill.slug ? (
+                <>
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  Installing
+                </>
+              ) : (
+                "Install"
+              )}
             </button>
             <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-tertiary)] font-medium bg-[var(--system-gray-6)] px-2 py-0.5 rounded-full border border-[var(--border-subtle)]">
               <Download className="w-3 h-3" />

@@ -116,7 +116,7 @@ export function ScanResultModal({
         {/* Header */}
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-lg font-semibold text-[var(--text-primary)]">
-            Security Scan: {targetName}
+            {isScanning ? `Installing ${targetName}` : `Security Scan: ${targetName}`}
           </h3>
           <button onClick={onClose}
             className="p-1.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] rounded-md hover:bg-black/5">
@@ -134,10 +134,10 @@ export function ScanResultModal({
                 </div>
                 <div>
                   <p className="text-sm font-semibold text-[var(--text-primary)]">
-                    Scanning {targetType}: {targetName}
+                    Scanning and installing {targetName}
                   </p>
                   <p className="text-xs text-[var(--text-secondary)] mt-1">
-                    Running Cisco scanner checks in an isolated runtime.
+                    Running security checks before installing the {targetType}.
                   </p>
                 </div>
               </div>
