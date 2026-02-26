@@ -5988,10 +5988,16 @@ fn normalize_openclaw_config(cfg: &mut serde_json::Value) {
             "http://localhost:5174"
         ]),
     );
+    // In the local Docker desktop setup, connections arrive from the Docker bridge
+    // IP (172.17.x.x), not loopback, so isLocalClient is always false even though
+    // allowInsecureAuth is true. dangerouslyDisableDeviceAuth bypasses the
+    // device-identity requirement for Control UI, which is safe here because
+    // the gateway is only reachable via 127.0.0.1:19789 on the host machine
+    // and is protected by the gateway token.
     set_openclaw_config_value(
         cfg,
         &["gateway", "controlUi", "dangerouslyDisableDeviceAuth"],
-        serde_json::json!(false),
+        serde_json::json!(true),
     );
 
     let telegram_dm_policy = cfg
