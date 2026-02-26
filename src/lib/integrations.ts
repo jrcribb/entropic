@@ -4,7 +4,7 @@ import { Store } from "@tauri-apps/plugin-store";
 import { createGatewayClient } from "./gateway";
 import { getGatewayStatusCached } from "./gateway-status";
 import { resolveGatewayAuth } from "./gateway-auth";
-import { apiRequest, getAccessToken, API_URL } from "./auth";
+import { apiRequest } from "./auth";
 import {
   loadIntegrationSecret,
   saveIntegrationSecret,
@@ -12,33 +12,6 @@ import {
   listIntegrationSecrets,
   listIntegrationIndexCache,
 } from "./vault";
-
-/**
- * Make an API request for X OAuth endpoints, falling back to the gateway token
- * if the Supabase session is unavailable. The server accepts both token types.
- */
-async function xApiRequest<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-  // Try Supabase token first
-  const supabaseToken = await getAccessToken();
-  const token = supabaseToken ?? await resolveGatewayAuth().then((a) => a.token).catch(() => null);
-  if (!token) {
-    throw new Error("Not authenticated");
-  }
-  const response = await fetch(`${API_URL}${endpoint}`, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-      ...(options.headers as Record<string, string> | undefined),
-    },
-  });
-  if (!response.ok) {
-    let errorBody: any = {};
-    try { errorBody = await response.json(); } catch { /* ignore */ }
-    throw new Error(errorBody?.error?.message || `API error: ${response.status}`);
-  }
-  return response.json() as Promise<T>;
-}
 
 const INTEGRATION_STORE = "entropic-integrations.json";
 const DEFAULT_INTEGRATIONS_REDIRECT_URL = (import.meta as any).env?.DEV
@@ -192,7 +165,7 @@ export async function connectIntegration(
   provider: IntegrationProvider
 ): Promise<{ oauthUrl?: string }> {
   if (provider === "x") {
-    const result = await xApiRequest<{ url: string }>("/x/oauth/start", {
+    const result = await apiRequest<{ url: string }>("/x/oauth/start", {
       method: "POST",
       body: JSON.stringify({ redirect_uri: INTEGRATIONS_REDIRECT_URL }),
     });
@@ -233,7 +206,7 @@ export async function connectIntegration(
 
 export async function disconnectIntegration(provider: IntegrationProvider): Promise<void> {
   if (provider === "x") {
-    await xApiRequest("/x/oauth/disconnect", { method: "POST" });
+    await apiRequest("/x/oauth/disconnect", { method: "POST" });
     integrationsCache = null;
     integrationsCachedIndex = null;
     window.dispatchEvent(new Event("entropic-integration-updated"));
@@ -246,7 +219,7 @@ export async function disconnectIntegration(provider: IntegrationProvider): Prom
 }
 
 async function getXIntegrationStatus(): Promise<Integration | null> {
-  const data = await xApiRequest<{
+  const data = await apiRequest<{
     connected: boolean;
     username?: string | null;
     expires_at?: string | null;

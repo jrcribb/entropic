@@ -9,7 +9,7 @@ import { getDeviceFingerprintHash } from "./localCredits";
 const SUPABASE_URL = (import.meta as any).env?.VITE_SUPABASE_URL || "";
 const SUPABASE_ANON_KEY = (import.meta as any).env?.VITE_SUPABASE_ANON_KEY || "";
 const RAW_API_URL = (import.meta as any).env?.VITE_API_URL || "";
-export const API_URL = RAW_API_URL || ((import.meta as any).env?.DEV ? "/api" : "");
+const API_URL = RAW_API_URL || ((import.meta as any).env?.DEV ? "/api" : "");
 const AUTH_REDIRECT_URL =
   (import.meta as any).env?.VITE_AUTH_REDIRECT_URL || "entropic://auth/callback";
 const AUTH_STORE_NAME =
@@ -504,6 +504,31 @@ export async function apiRequest<T>(
       } catch {
         errorBody = {};
       }
+    }
+    // On 401: try to force-refresh the Supabase session and retry once.
+    // This handles the case where the JWT expired but the refresh token is still valid.
+    if (response.status === 401 && supabase) {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.refresh_token) {
+        const refreshed = await supabase.auth.refreshSession({ refresh_token: session.refresh_token });
+        const newToken = refreshed.data.session?.access_token;
+        if (newToken && newToken !== token) {
+          const retryResponse = await fetch(`${API_URL}${endpoint}`, {
+            ...options,
+            headers: {
+              Authorization: `Bearer ${newToken}`,
+              "Content-Type": "application/json",
+              ...options.headers,
+            },
+          });
+          if (retryResponse.ok) return retryResponse.json();
+        }
+      }
+      // Refresh didn't help — session is truly dead, user needs to sign in again.
+      throw new ApiRequestError(
+        "Session expired — please sign out and sign back in.",
+        { status: 401, data: errorBody, kind: "http" }
+      );
     }
     throw new ApiRequestError(
       errorBody?.error?.message || `API error: ${response.status}`,
