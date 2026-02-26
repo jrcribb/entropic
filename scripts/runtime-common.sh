@@ -127,6 +127,12 @@ entropic_find_colima_binary() {
     local project_root="${1:-}"
     local candidates=()
 
+    # Prefer the system colima first — bundled binaries may be Gatekeeper-rejected
+    # on macOS (they pass --version but hang or get killed on actual VM operations).
+    if command -v colima >/dev/null 2>&1; then
+        candidates+=("$(command -v colima)")
+    fi
+
     if [ -n "$project_root" ]; then
         if [ -x "$project_root/src-tauri/target/debug/resources/bin/colima" ]; then
             candidates+=("$project_root/src-tauri/target/debug/resources/bin/colima")
@@ -134,10 +140,6 @@ entropic_find_colima_binary() {
         if [ -x "$project_root/src-tauri/resources/bin/colima" ]; then
             candidates+=("$project_root/src-tauri/resources/bin/colima")
         fi
-    fi
-
-    if command -v colima >/dev/null 2>&1; then
-        candidates+=("$(command -v colima)")
     fi
 
     local path
