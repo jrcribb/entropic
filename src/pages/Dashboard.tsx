@@ -236,6 +236,18 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
   }, []);
 
   useEffect(() => {
+    const handleStartGateway = () => {
+      if (!gatewayRunning && !isTogglingGateway) {
+        void toggleGateway();
+      }
+    };
+    window.addEventListener("entropic-start-gateway", handleStartGateway);
+    return () => {
+      window.removeEventListener("entropic-start-gateway", handleStartGateway);
+    };
+  }, [gatewayRunning, isTogglingGateway]);
+
+  useEffect(() => {
     if (!experimentalDesktop && currentPage === "files") {
       setCurrentPage("chat");
     }

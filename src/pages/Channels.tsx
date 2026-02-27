@@ -284,6 +284,9 @@ export function Channels() {
     setSavingSetup(true);
     setSaveMessage(null);
     setSaveError(null);
+    // Snapshot before the config write — set_channels_config triggers a brief
+    // SIGUSR1 reload that makes the post-save health check transiently return false.
+    const wasRunning = gatewayRunning;
     try {
       await invoke("set_channels_config", {
         discordEnabled: false,
@@ -312,7 +315,7 @@ export function Channels() {
       setTelegramConnected(false);
       setSaveMessage("Telegram disconnected.");
       const running = await refreshGatewayRunningStatus();
-      if (running) {
+      if (wasRunning || running) {
         try {
           await invoke("restart_gateway_in_place");
         } catch {
@@ -363,6 +366,11 @@ export function Channels() {
         setTelegramEnabled(true);
       }
 
+      // Snapshot gateway running state BEFORE the config write, which triggers a
+      // brief SIGUSR1 internal reload that can make the health check return false
+      // mid-restart — causing us to incorrectly treat a running gateway as stopped.
+      const wasRunning = gatewayRunning;
+
       console.log("[Channels] Invoking set_channels_config...");
       await invoke("set_channels_config", {
         discordEnabled: false,
@@ -393,9 +401,12 @@ export function Channels() {
       ]);
       setTelegramConnected(Boolean(connected));
       setGatewayRunning(Boolean(running));
+      // Use the pre-save snapshot for restart decisions: the post-save health check
+      // can transiently return false during the SIGUSR1 config reload.
+      const effectiveRunning = wasRunning || running;
 
       // Auto-restart gateway after saving token to apply changes immediately
-      if (target === "token" && running) {
+      if (target === "token" && effectiveRunning) {
         const botHandle = validationResult?.username?.trim() ? ` @${validationResult.username.trim()}` : "";
         setSaveMessage(`Bot token saved${botHandle}. Restarting gateway...`);
 
@@ -424,14 +435,16 @@ export function Channels() {
           setSaveMessage(`Bot token saved${botHandle}. Gateway restart failed: ${detail}`);
           setRestartPending(true);
         }
-      } else if (target === "token" && !running) {
+      } else if (target === "token" && !effectiveRunning) {
         const botHandle = validationResult?.username?.trim() ? ` @${validationResult.username.trim()}` : "";
-        setSaveMessage(`Bot token saved${botHandle}. Start the gateway to activate your bot.`);
+        setSaveMessage(`Bot token saved${botHandle}. Starting gateway...`);
+        // Gateway is not running — ask Dashboard to start it
+        window.dispatchEvent(new CustomEvent("entropic-start-gateway"));
       } else {
         // Settings update (not initial token save)
-        setRestartPending(Boolean(running));
+        setRestartPending(Boolean(effectiveRunning));
         setSaveMessage(
-          running
+          effectiveRunning
             ? "Telegram settings saved. Restart gateway to apply changes."
             : "Telegram settings saved. Changes will apply on next gateway start."
         );

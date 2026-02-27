@@ -135,6 +135,21 @@ export function TelegramSetupModal({ isOpen, onClose, onSetupComplete }: Props) 
 
       setTokenSaved(true);
       const botHandle = validation.username?.trim() ? ` (@${validation.username.trim()})` : "";
+
+      // Restart or start gateway so the new token takes effect immediately
+      const gatewayRunning = await invoke<boolean>("get_gateway_status").catch(() => false);
+      if (gatewayRunning) {
+        setStatusMsg(`Bot token saved${botHandle}. Restarting gateway...`);
+        try {
+          await invoke("restart_gateway_in_place");
+        } catch {
+          // Non-fatal — token is saved, gateway restart can be done manually
+        }
+      } else {
+        setStatusMsg(`Bot token saved${botHandle}. Starting gateway...`);
+        window.dispatchEvent(new CustomEvent("entropic-start-gateway"));
+      }
+
       setStatusMsg(`Bot token saved${botHandle}. Send /start to your bot and paste the pairing code below.`);
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
