@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
@@ -16,6 +16,15 @@ import {
 } from "../lib/integrations";
 import { ScanResultModal, type PluginScanResult } from "../components/ScanResultModal";
 
+// Module-level cache for the ClawHub catalog — survives page navigation.
+// Keyed by "sort:query" so different sort/search results are cached independently.
+const CLAWHUB_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const PAGE_SIZE = 20; // items per page
+type ClawhubCacheEntry = {
+  items: ClawhubCatalogSkill[];
+  ts: number;
+};
+const clawhubCatalogCache = new Map<string, ClawhubCacheEntry>();
 
 type Plugin = {
   id: string;
@@ -318,6 +327,9 @@ export function Store({
   const [removingSkill, setRemovingSkill] = useState<string | null>(null);
   const [skillScanResults, setSkillScanResults] = useState<Record<string, PluginScanResult>>({});
   const [gatewayRestarting, setGatewayRestarting] = useState(false);
+  // How many browse-skills are currently visible (incremented on scroll)
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
   const syncedIntegrationsRef = useRef<Set<string>>(new Set());
   const [justInstalledSlugs, setJustInstalledSlugs] = useState<Set<string>>(new Set());
 
@@ -415,38 +427,43 @@ export function Store({
     }
   }
 
-  async function refreshClawhubCatalog(opts?: { silent?: boolean }) {
-    if (!opts?.silent) {
-      setClawhubLoading(true);
+  const refreshClawhubCatalog = useCallback(async (opts?: { silent?: boolean; force?: boolean }) => {
+    const fetchSort =
+      clawhubSort === "newest" ? "newest"
+      : clawhubSort === "downloads" ? "downloads"
+      : clawhubSort === "installs" ? "installsAllTime"
+      : "rating";
+    const cacheKey = `${fetchSort}:${skillQuery.trim()}`;
+
+    // Serve from cache if fresh and not forced
+    if (!opts?.force) {
+      const cached = clawhubCatalogCache.get(cacheKey);
+      if (cached && Date.now() - cached.ts < CLAWHUB_CACHE_TTL_MS) {
+        setClawhubCatalog(cached.items);
+        setVisibleCount(PAGE_SIZE);
+        return;
+      }
     }
+
+    if (!opts?.silent) setClawhubLoading(true);
     setClawhubLookupError(null);
     try {
-      const fetchSort =
-        clawhubSort === "newest"
-          ? "newest"
-          : clawhubSort === "downloads"
-            ? "downloads"
-            : clawhubSort === "installs"
-              ? "installsAllTime"
-              : "rating";
+      // Fetch enough to fill several pages; ClawHub rate-limits per request so
+      // we fetch a reasonable max up front and paginate client-side.
       const list = await invoke<ClawhubCatalogSkill[]>("get_clawhub_catalog", {
         query: skillQuery.trim() || null,
-        limit: 60,
+        limit: 100,
         sort: fetchSort,
       });
       const sorted = [...list].sort((a, b) => {
-        if (clawhubSort === "newest") {
-          return (b.updated_at || 0) - (a.updated_at || 0);
-        }
-        if (clawhubSort === "downloads") {
-          return b.downloads - a.downloads;
-        }
-        if (clawhubSort === "installs") {
-          return b.installs_all_time - a.installs_all_time;
-        }
+        if (clawhubSort === "newest") return (b.updated_at || 0) - (a.updated_at || 0);
+        if (clawhubSort === "downloads") return b.downloads - a.downloads;
+        if (clawhubSort === "installs") return b.installs_all_time - a.installs_all_time;
         return b.stars - a.stars;
       });
+      clawhubCatalogCache.set(cacheKey, { items: sorted, ts: Date.now() });
       setClawhubCatalog(sorted);
+      setVisibleCount(PAGE_SIZE);
     } catch (err) {
       const message = String(err);
       setClawhubLookupError(message);
@@ -454,7 +471,7 @@ export function Store({
     } finally {
       setClawhubLoading(false);
     }
-  }
+  }, [clawhubSort, skillQuery]);
 
   async function refreshIntegrations(opts?: { force?: boolean }) {
     let cached: Integration[] = [];
@@ -525,7 +542,23 @@ export function Store({
       refreshClawhubCatalog();
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [skillQuery, clawhubSort]);
+  }, [skillQuery, clawhubSort, refreshClawhubCatalog]);
+
+  // Infinite scroll: when the sentinel div enters the viewport, show more items.
+  useEffect(() => {
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) {
+          setVisibleCount((n) => n + PAGE_SIZE);
+        }
+      },
+      { threshold: 0.1 }
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [clawhubCatalog.length]);
 
   useEffect(() => {
     if (!setupProvider) return;
@@ -924,10 +957,15 @@ export function Store({
     [clawhubCatalog]
   );
 
-  const browseSkills = useMemo(
+  const allBrowseSkills = useMemo(
     () => clawhubCatalog.filter((s) => !FEATURED_SLUGS.has(s.slug)),
     [clawhubCatalog]
   );
+  const browseSkills = useMemo(
+    () => allBrowseSkills.slice(0, visibleCount),
+    [allBrowseSkills, visibleCount]
+  );
+  const hasMoreBrowseSkills = visibleCount < allBrowseSkills.length;
 
   const isRateLimited = clawhubCatalog.some((s) => s.is_fallback);
   const activeClawhubSkill = clawhubDetailModalSlug
@@ -1193,9 +1231,16 @@ export function Store({
                     <p className="font-semibold">{clawhubLookupError}</p>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {browseSkills.map((skill) => renderClawhubSkillCard(skill))}
-                  </div>
+                  <>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {browseSkills.map((skill) => renderClawhubSkillCard(skill))}
+                    </div>
+                    {hasMoreBrowseSkills && (
+                      <div ref={sentinelRef} className="py-8 flex justify-center">
+                        <Loader2 className="w-5 h-5 animate-spin text-[var(--text-tertiary)]" />
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             </div>
