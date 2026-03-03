@@ -50,7 +50,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUNTIME_RELEASE_TAG: runtime-latest
-          RUNTIME_RELEASE_REPO: dominant-strategies/entropic-releases-sandbox
+          RUNTIME_RELEASE_REPO: dominant-strategies/entropic-releases
         run: |
           set -euo pipefail
           RESOURCES_DIR="src-tauri/resources"
