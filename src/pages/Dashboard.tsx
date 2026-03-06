@@ -39,7 +39,7 @@ type Props = {
 };
 
 // Default models per mode
-const DEFAULT_PROXY_MODEL = "openai/gpt-5.2";
+const DEFAULT_PROXY_MODEL = "openai/gpt-5.4";
 const DEFAULT_LOCAL_MODEL = "anthropic/claude-opus-4-6:thinking";
 const GATEWAY_FAILURE_THRESHOLD = 3;
 const FEEDBACK_FORM_URL = "https://entropic.qu.ai/feedback";
@@ -71,8 +71,8 @@ export function Dashboard({ status: _status, onRefresh: _onRefresh }: Props) {
   const [integrationsMissing, setIntegrationsMissing] = useState(false);
   const [prefsLoaded, setPrefsLoaded] = useState(false);
   const [selectedModel, setSelectedModel] = useState(DEFAULT_PROXY_MODEL);
-  const [codeModel, setCodeModel] = useState("openai/gpt-5.2-codex");
-  const [imageModel, setImageModel] = useState("google/gemini-3-pro-image-preview");
+  const [codeModel, setCodeModel] = useState("openai/gpt-5.3-codex");
+  const [imageModel, setImageModel] = useState("google/gemini-3.1-flash-image-preview");
   const [experimentalDesktop, setExperimentalDesktop] = useState(false);
   const [chatSessions, setChatSessions] = useState<ChatSession[]>([]);
   const [currentChatSession, setCurrentChatSession] = useState<string | null>(null);
