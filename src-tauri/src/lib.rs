@@ -193,6 +193,7 @@ pub fn run() {
             commands::refresh_provider_token,
             commands::get_oauth_status,
             commands::list_workspace_files,
+            commands::create_workspace_directory,
             commands::read_workspace_file,
             commands::read_workspace_file_base64,
             commands::delete_workspace_file,

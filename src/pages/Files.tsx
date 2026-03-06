@@ -79,6 +79,20 @@ type ViewMode = "grid" | "list";
 type ChatMessage = { id: string; role: "user" | "assistant"; content: string };
 type DesktopIcon = { id: string; x: number; y: number };
 
+const DEFAULT_WINDOW_Z: Record<string, number> = {
+  finder: 60,
+  chat: 61,
+  browser: 62,
+  plugins: 63,
+  skills: 64,
+  channels: 65,
+  tasks: 66,
+  jobs: 67,
+  logs: 68,
+  billing: 69,
+  settings: 70,
+};
+
 const HIDDEN_FILES = new Set(["HEARTBEAT.md", "IDENTITY.md", "SOUL.md", "TOOLS.md", "AGENTS.md", "USER.md"]);
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"]);
 const BINARY_EXTS = new Set(["pdf", "zip", "xlsx", "xls", "docx", "pptx"]);
@@ -194,7 +208,7 @@ function AppWindow({
         boxShadow: "0 24px 70px rgba(0,0,0,0.28), 0 0 0 0.5px rgba(255,255,255,0.6)",
         border: "1px solid rgba(255,255,255,0.65)",
       }}
-      onMouseDown={onFocus}
+      onMouseDownCapture={onFocus}
       onClick={(e) => e.stopPropagation()}
     >
       <div
@@ -307,11 +321,8 @@ export function Files({
   const logsDragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null);
   const billingDragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null);
   const settingsDragRef = useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null);
-  const zCounter = useRef(60);
-  const [windowZ, setWindowZ] = useState<Record<string, number>>({
-    finder: 60,
-    chat: 61,
-  });
+  const zCounter = useRef(Math.max(...Object.values(DEFAULT_WINDOW_Z)));
+  const [windowZ, setWindowZ] = useState<Record<string, number>>(DEFAULT_WINDOW_Z);
 
   // File browser
   const [entries, setEntries] = useState<WorkspaceFileEntry[]>([]);
@@ -614,7 +625,10 @@ export function Files({
   async function handleCreateFolder(basePath?: string) {
     const name = prompt("New folder name:"); if (!name?.trim()) return;
     const root = typeof basePath === "string" ? basePath : currentPath;
-    try { const p = root ? `${root}/${name.trim()}` : name.trim(); await invoke<WorkspaceFileEntry[]>("list_workspace_files", { path: p }); if (finderOpen) fetchFiles(currentPath); }
+    try {
+      await invoke<WorkspaceFileEntry>("create_workspace_directory", { parentPath: root, name: name.trim() });
+      if (finderOpen) await fetchFiles(currentPath);
+    }
     catch (e) { setError(`Failed to create folder: ${e instanceof Error ? e.message : String(e)}`); }
   }
 
@@ -850,7 +864,7 @@ export function Files({
                 border: "0.5px solid rgba(255,255,255,0.08)",
                 zIndex: windowZ.finder ?? 60,
               }}
-              onMouseDown={() => focusWindow("finder")}
+              onMouseDownCapture={() => focusWindow("finder")}
               onClick={(e) => e.stopPropagation()}
             >
               {/* Title bar — drag handle */}
@@ -1074,7 +1088,7 @@ export function Files({
                 border: "0.5px solid rgba(255,255,255,0.08)",
                 zIndex: windowZ.chat ?? 61,
               }}
-              onMouseDown={() => focusWindow("chat")}
+              onMouseDownCapture={() => focusWindow("chat")}
               onClick={(e) => e.stopPropagation()}
             >
               {/* Title bar — drag handle */}

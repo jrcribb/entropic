@@ -4566,6 +4566,31 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
+fn sanitize_directory_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Folder name is required".to_string());
+    }
+
+    if trimmed == "." || trimmed == ".." {
+        return Err("Invalid folder name".to_string());
+    }
+
+    let mut out = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_' || ch == ' ' {
+            out.push(ch);
+        }
+    }
+
+    let normalized = out.trim();
+    if normalized.is_empty() {
+        return Err("Folder name contains no valid characters".to_string());
+    }
+
+    Ok(normalized.to_string())
+}
+
 fn generate_attachment_id() -> String {
     let mut bytes = [0u8; ATTACHMENT_ID_RANDOM_BYTES];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -11225,6 +11250,31 @@ pub async fn list_workspace_files(path: String) -> Result<Vec<WorkspaceFileEntry
         });
     }
     Ok(entries)
+}
+
+#[tauri::command]
+pub async fn create_workspace_directory(
+    parent_path: String,
+    name: String,
+) -> Result<WorkspaceFileEntry, String> {
+    let sanitized_parent = sanitize_workspace_path(&parent_path)?;
+    let sanitized_name = sanitize_directory_name(&name)?;
+    let relative_path = if sanitized_parent.is_empty() {
+        sanitized_name.clone()
+    } else {
+        format!("{}/{}", sanitized_parent, sanitized_name)
+    };
+    let full_path = format!("{}/{}", WORKSPACE_ROOT, relative_path);
+
+    docker_exec_output(&["exec", OPENCLAW_CONTAINER, "mkdir", "-p", "--", &full_path])?;
+
+    Ok(WorkspaceFileEntry {
+        name: sanitized_name,
+        path: relative_path,
+        is_directory: true,
+        size: 0,
+        modified_at: 0,
+    })
 }
 
 #[tauri::command]
