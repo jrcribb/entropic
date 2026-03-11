@@ -132,6 +132,22 @@ export function Channels() {
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  async function waitForGatewayRunningStatus(
+    attempts = 8,
+    delayMs = 1500
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      const running = await refreshGatewayRunningStatus();
+      if (running) {
+        return true;
+      }
+      if (attempt < attempts - 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+      }
+    }
+    return false;
+  }
+
   async function refreshTelegramConnectedStatus() {
     const connected = await invoke<boolean>("get_telegram_connection_status").catch(() => false);
     setTelegramConnected(Boolean(connected));
@@ -240,6 +256,21 @@ export function Channels() {
       clearInterval(pollInterval);
     };
   }, [telegramTokenSaved, telegramConnected]);
+
+  useEffect(() => {
+    if (!gatewayRunning || !saveMessage) {
+      return;
+    }
+
+    if (
+      saveMessage.includes("Gateway restart in progress") ||
+      saveMessage.includes("Restarting gateway...")
+    ) {
+      setSaveMessage(
+        "Gateway restarted. Message your bot on Telegram and send /start to receive a pairing code."
+      );
+    }
+  }, [gatewayRunning, saveMessage]);
 
   async function autoConfigureTelegram(params: {
     enabled: boolean;
@@ -414,13 +445,8 @@ export function Channels() {
           console.log("[Channels] Auto-restarting gateway to apply Telegram configuration...");
           await invoke("restart_gateway_in_place");
 
-          // Wait a moment for gateway to restart
-          await new Promise(resolve => setTimeout(resolve, 2000));
-
-          const [newConnected, newRunning] = await Promise.all([
-            refreshTelegramConnectedStatus(),
-            refreshGatewayRunningStatus(),
-          ]);
+          const newRunning = await waitForGatewayRunningStatus();
+          const newConnected = await refreshTelegramConnectedStatus();
           setTelegramConnected(Boolean(newConnected));
           setGatewayRunning(Boolean(newRunning));
 
