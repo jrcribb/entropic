@@ -11,6 +11,11 @@ Set-StrictMode -Version Latest
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $ScriptDir ".."))
 $RuntimeTar = Join-Path $ProjectRoot "src-tauri\resources\openclaw-runtime.tar.gz"
+$RuntimeResourcesDir = Join-Path $ProjectRoot "src-tauri\resources\runtime"
+$LocalAppData = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { (Join-Path $HOME "AppData\Local") }
+$ManagedWslRoot = Join-Path $LocalAppData "Entropic\runtime\wsl"
+$ManagedWslArtifact = Join-Path $RuntimeResourcesDir "entropic-runtime.tar"
+$ManagedWslArtifactHash = Join-Path $RuntimeResourcesDir "entropic-runtime.sha256"
 $DebugBinaryPath = Join-Path $ProjectRoot "src-tauri\target\debug\entropic.exe"
 $ReleaseBinaryPath = Join-Path $ProjectRoot "src-tauri\target\release\entropic.exe"
 
@@ -60,6 +65,62 @@ function Invoke-WslProjectBash([string]$Command) {
     & wsl -d entropic-dev --cd $projectRootWsl -- bash -lc $Command
 }
 
+function Get-ManagedDistroInstallPath([string]$DistroName) {
+    return (Join-Path $ManagedWslRoot $DistroName)
+}
+
+function Test-WslRuntimeArtifactFresh {
+    if (-not (Test-FileNonEmpty $ManagedWslArtifact) -or -not (Test-FileNonEmpty $ManagedWslArtifactHash)) {
+        return $false
+    }
+
+    $artifactWriteTime = (Get-Item -Path $ManagedWslArtifact).LastWriteTimeUtc
+    $freshnessInputs = @(
+        (Join-Path $ProjectRoot "scripts\dev-wsl-runtime.ps1"),
+        (Join-Path $ProjectRoot "src-tauri\src\runtime.rs"),
+        (Join-Path $ProjectRoot "src-tauri\src\commands.rs")
+    )
+
+    foreach ($path in $freshnessInputs) {
+        if ((Test-Path -Path $path -PathType Leaf) -and ((Get-Item -Path $path).LastWriteTimeUtc -gt $artifactWriteTime)) {
+            return $false
+        }
+    }
+
+    $ext4Path = Join-Path (Get-ManagedDistroInstallPath "entropic-dev") "ext4.vhdx"
+    if ((Test-Path -Path $ext4Path -PathType Leaf) -and ((Get-Item -Path $ext4Path).LastWriteTimeUtc -gt $artifactWriteTime)) {
+        return $false
+    }
+
+    return $true
+}
+
+function Write-WslArtifactHashes([string]$ArtifactPath) {
+    $hash = (Get-FileHash -Path $ArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Set-Content -Path "$ArtifactPath.sha256" -Value $hash -NoNewline
+    Set-Content -Path $ManagedWslArtifactHash -Value $hash -NoNewline
+}
+
+function Ensure-WslRuntimeArtifacts {
+    if (Test-WslRuntimeArtifactFresh) {
+        return
+    }
+
+    Write-Host "[wsl] Managed WSL rootfs artifact is stale; exporting current entropic-dev distro."
+    New-Item -ItemType Directory -Force -Path $RuntimeResourcesDir | Out-Null
+
+    Remove-Item -Path $ManagedWslArtifact -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "$ManagedWslArtifact.sha256" -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $ManagedWslArtifactHash -Force -ErrorAction SilentlyContinue
+
+    & wsl --export entropic-dev $ManagedWslArtifact
+    if ($LASTEXITCODE -ne 0 -or -not (Test-FileNonEmpty $ManagedWslArtifact)) {
+        throw "Failed exporting Docker-ready entropic-dev WSL distro to $ManagedWslArtifact"
+    }
+
+    Write-WslArtifactHashes -ArtifactPath $ManagedWslArtifact
+}
+
 function Resolve-ReleaseBinaryPath {
     $candidates = @(
         (Join-Path $ProjectRoot "src-tauri\target\release\entropic.exe"),
@@ -89,7 +150,7 @@ function Ensure-DevRuntimeTar {
         throw "OpenClaw dist missing at $openClawDist. Build openclaw first."
     }
 
-    $bashCommand = "set -euo pipefail; ENTROPIC_BUILD_ALLOW_DOCKER_DESKTOP=1 ./scripts/build-openclaw-runtime.sh; ENTROPIC_BUILD_ALLOW_DOCKER_DESKTOP=1 ./scripts/bundle-runtime-image.sh"
+    $bashCommand = "set -euo pipefail; ./scripts/build-openclaw-runtime.sh; ./scripts/bundle-runtime-image.sh"
 
     Invoke-WslProjectBash -Command $bashCommand
     if ($LASTEXITCODE -ne 0 -or -not (Test-FileNonEmpty $RuntimeTar)) {
@@ -139,6 +200,7 @@ if ($ReleaseBinary) {
 } else {
     if ($Mode -eq "dev") {
         Ensure-DevRuntimeTar
+        Ensure-WslRuntimeArtifacts
     }
     Stop-StaleDebugEntropicProcess
     & pnpm.cmd tauri:dev

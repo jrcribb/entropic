@@ -63,6 +63,15 @@ ensure_docker_ready_for_mode() {
         return 1
     fi
 
+    # Windows local user-test builds run this script inside the managed WSL
+    # distro, where Docker lives on the in-distro unix socket rather than a
+    # Colima context. Only prefer that engine when we are actually inside WSL.
+    if [ -n "${WSL_DISTRO_NAME:-}" ] && \
+        env -u DOCKER_CONTEXT DOCKER_HOST=unix:///var/run/docker.sock "$DOCKER_BIN" info >/dev/null 2>&1; then
+        ACTIVE_DOCKER_HOST="unix:///var/run/docker.sock"
+        return 0
+    fi
+
     ACTIVE_DOCKER_HOST="$(entropic_resolve_mode_docker_host "$DOCKER_BIN" || true)"
     if [ -z "$ACTIVE_DOCKER_HOST" ] && [ -n "$COLIMA_BIN" ]; then
         echo "Starting Colima for $(entropic_mode_label) runtime build..."
@@ -138,7 +147,12 @@ normalize_tree_permissions() {
     find "$root" -type d -exec chmod 755 {} +
     find "$root" -type f -print0 | while IFS= read -r -d '' file; do
         local mode
-        mode="$(stat -f '%OLp' "$file" 2>/dev/null || stat -c '%a' "$file" 2>/dev/null || echo 644)"
+        mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%OLp' "$file" 2>/dev/null || echo 644)"
+        mode="${mode##*$'\n'}"
+        mode="${mode//[!0-7]/}"
+        if [ -z "$mode" ]; then
+            mode="644"
+        fi
         if [ $((8#$mode & 0111)) -ne 0 ]; then
             chmod 755 "$file"
         else
@@ -176,7 +190,7 @@ rsync -a --delete "$OPENCLAW_SOURCE/dist/" "$STAGING_DIR/dist/"
 # partially built, those concrete `dist/plugin-sdk/<entry>.js` files may be
 # missing even though `dist/plugin-sdk/index.js` still exports the required
 # symbols. Synthesize minimal JS entry shims so bundled extensions keep loading.
-if [ -f "$STAGING_DIR/dist/plugin-sdk/index.js" ]; then
+if [ -f "$STAGING_DIR/dist/plugin-sdk/index.js" ] && command -v node >/dev/null 2>&1; then
     while IFS= read -r entry; do
         [ -n "$entry" ] || continue
         target="$STAGING_DIR/dist/plugin-sdk/${entry}.js"
@@ -192,6 +206,8 @@ for (const key of Object.keys(pkg.exports || {})) {
   console.log(entry);
 }
 ' "$OPENCLAW_SOURCE/package.json")
+elif [ -f "$STAGING_DIR/dist/plugin-sdk/index.js" ]; then
+    echo "WARNING: node not found in build distro; skipping plugin-sdk shim synthesis." >&2
 fi
 
 # Copy package.json
@@ -276,9 +292,11 @@ copy_source_node_modules() {
 copy_filtered_node_modules() {
     local source_dir="$1"
     local dest_dir="$2"
+    local staging_dir="${dest_dir}.incoming"
+    local backup_dir="${dest_dir}.previous"
 
-    rm -rf "$dest_dir"
-    mkdir -p "$dest_dir"
+    rm -rf "$staging_dir" "$backup_dir"
+    mkdir -p "$staging_dir"
 
     if rsync -a --delete \
         --exclude='.cache' \
@@ -286,21 +304,29 @@ copy_filtered_node_modules() {
         --exclude='test' \
         --exclude='tests' \
         --exclude='.git' \
-        "$source_dir/" "$dest_dir/"; then
-        return 0
+        "$source_dir/" "$staging_dir/"; then
+        :
+    else
+        echo "WARNING: rsync copy failed for $source_dir. Retrying with tar stream..."
+        rm -rf "$staging_dir"
+        mkdir -p "$staging_dir"
+
+        tar -C "$source_dir" \
+            --exclude='.cache' \
+            --exclude='*.map' \
+            --exclude='test' \
+            --exclude='tests' \
+            --exclude='.git' \
+            -cf - . | tar -C "$staging_dir" -xf -
     fi
 
-    echo "WARNING: rsync copy failed for $source_dir. Retrying with tar stream..."
-    rm -rf "$dest_dir"
-    mkdir -p "$dest_dir"
+    if [ -e "$dest_dir" ]; then
+        chmod -R u+w "$dest_dir" 2>/dev/null || true
+        mv "$dest_dir" "$backup_dir"
+    fi
 
-    tar -C "$source_dir" \
-        --exclude='.cache' \
-        --exclude='*.map' \
-        --exclude='test' \
-        --exclude='tests' \
-        --exclude='.git' \
-        -cf - . | tar -C "$dest_dir" -xf -
+    mv "$staging_dir" "$dest_dir"
+    rm -rf "$backup_dir" 2>/dev/null || true
 }
 
 if command -v pnpm >/dev/null 2>&1; then
@@ -321,7 +347,7 @@ if command -v pnpm >/dev/null 2>&1; then
             fi
         fi
     else
-        echo "WARNING: pnpm deploy --prod failed. Falling back to staged prune."
+        echo "WARNING: pnpm deploy --prod failed. Falling back to staged prune (install Linux node/pnpm in entropic-dev for faster local Windows builds)."
         copy_source_node_modules
         if [ -f "$OPENCLAW_SOURCE/pnpm-lock.yaml" ]; then
             rsync -a "$OPENCLAW_SOURCE/pnpm-lock.yaml" "$STAGING_DIR/pnpm-lock.yaml"
@@ -333,7 +359,7 @@ if command -v pnpm >/dev/null 2>&1; then
         fi
     fi
 else
-    echo "WARNING: pnpm not found. Falling back to source node_modules copy."
+    echo "WARNING: pnpm not found. Falling back to source node_modules copy (run 'pnpm.cmd dev:wsl:start:dev' to bootstrap the Linux toolchain)."
     copy_source_node_modules
 fi
 

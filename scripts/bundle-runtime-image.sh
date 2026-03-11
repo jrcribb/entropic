@@ -33,6 +33,8 @@ fi
 
 if [ -n "${DOCKER_HOST:-}" ]; then
     ACTIVE_DOCKER_HOST="$DOCKER_HOST"
+elif [ -n "${WSL_DISTRO_NAME:-}" ] && env -u DOCKER_CONTEXT DOCKER_HOST=unix:///var/run/docker.sock "$DOCKER_BIN" info >/dev/null 2>&1; then
+    ACTIVE_DOCKER_HOST="unix:///var/run/docker.sock"
 else
     ACTIVE_DOCKER_HOST="$(entropic_resolve_mode_docker_host "$DOCKER_BIN" || true)"
 fi

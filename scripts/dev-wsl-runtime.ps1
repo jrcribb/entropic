@@ -209,13 +209,41 @@ function Start-Distro([string]$Name) {
     }
 }
 
+function Convert-ToWslPath([string]$WindowsPath) {
+    $full = [System.IO.Path]::GetFullPath($WindowsPath)
+    if ($full -match "^[A-Za-z]:\\") {
+        $drive = $full.Substring(0, 1).ToLowerInvariant()
+        $rest = $full.Substring(2).Replace("\", "/")
+        return "/mnt/$drive$rest"
+    }
+    throw "Cannot convert path to WSL form: $WindowsPath"
+}
+
+function Invoke-DistroRootBash([string]$Name, [string]$Script) {
+    $tempDir = Join-Path $RuntimeRoot "bootstrap-scripts"
+    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+
+    $tempPath = Join-Path $tempDir ("bootstrap-" + [guid]::NewGuid().ToString("N") + ".sh")
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    $normalized = ($Script -replace "`r`n", "`n").TrimEnd() + "`n"
+    [System.IO.File]::WriteAllText($tempPath, $normalized, $encoding)
+
+    try {
+        $tempPathWsl = Convert-ToWslPath $tempPath
+        & wsl -d $Name --user root --exec bash $tempPathWsl
+        return $LASTEXITCODE
+    } finally {
+        Remove-Item -Path $tempPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-DockerResponsive([string]$Name) {
     $probe = @(
         "if ! command -v docker >/dev/null 2>&1; then"
         "  exit 42"
         "fi"
         "if command -v curl >/dev/null 2>&1; then"
-        "  timeout 10 curl -fsS --unix-socket /var/run/docker.sock http://localhost/_ping >/dev/null"
+        "  timeout 10 curl -fsS --unix-socket /var/run/docker.sock http://localhost/_ping >/dev/null 2>&1"
         "else"
         "  timeout 10 env -u DOCKER_CONTEXT DOCKER_HOST=unix:///var/run/docker.sock docker version >/dev/null 2>&1"
         "fi"
@@ -225,6 +253,45 @@ function Test-DockerResponsive([string]$Name) {
     return $LASTEXITCODE
 }
 
+function Bootstrap-DevDocker([string]$Name) {
+    Write-Host "[wsl] Bootstrapping Docker inside $Name..."
+    $bootstrapCommand = @(
+        'set -euo pipefail'
+        'export DEBIAN_FRONTEND=noninteractive'
+        'if ! command -v apt-get >/dev/null 2>&1; then'
+        '  echo "apt-get is required to install Docker in this distro." >&2'
+        '  exit 1'
+        'fi'
+        'apt-get update'
+        'apt-get install -y docker.io'
+        'if command -v systemctl >/dev/null 2>&1; then'
+        '  systemctl enable docker >/dev/null 2>&1 || true'
+        '  systemctl start docker >/dev/null 2>&1 || true'
+        'elif command -v service >/dev/null 2>&1; then'
+        '  service docker start >/dev/null 2>&1 || true'
+        'fi'
+        'if [ ! -S /var/run/docker.sock ]; then'
+        '  mkdir -p /run /var/log'
+        '  nohup dockerd >/var/log/dockerd.log 2>&1 &'
+        'fi'
+        'i=0'
+        'while [ "$i" -lt 30 ]; do'
+        '  if env -u DOCKER_CONTEXT DOCKER_HOST=unix:///var/run/docker.sock docker info >/dev/null 2>&1; then'
+        '    exit 0'
+        '  fi'
+        '  i=$((i+1))'
+        '  sleep 2'
+        'done'
+        'tail -n 120 /var/log/dockerd.log 2>/dev/null || true'
+        'exit 1'
+    ) -join "`n"
+
+    Invoke-DistroRootBash $Name $bootstrapCommand
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to bootstrap Docker in '$Name'. Verify network access in the distro and inspect /var/log/dockerd.log."
+    }
+}
+
 function Ensure-DevDockerReady([string]$Name) {
     $probeExit = Test-DockerResponsive $Name
     if ($probeExit -eq 0) {
@@ -232,7 +299,12 @@ function Ensure-DevDockerReady([string]$Name) {
     }
 
     if ($probeExit -eq 42) {
-        throw "Docker is not installed in '$Name'. Recreate the dev runtime or install Docker in the distro."
+        Bootstrap-DevDocker $Name
+        $probeExit = Test-DockerResponsive $Name
+        if ($probeExit -eq 0) {
+            Write-Host "[wsl] Docker in $Name is ready after bootstrap."
+            return
+        }
     }
 
     Write-Host "[wsl] Docker in $Name is unresponsive. Restarting the distro..."
@@ -253,10 +325,85 @@ function Ensure-DevDockerReady([string]$Name) {
     }
 
     if ($retryExit -eq 42) {
-        throw "Docker disappeared from '$Name' after restart. Recreate the dev runtime or install Docker in the distro."
+        Bootstrap-DevDocker $Name
+        $retryExit = Test-DockerResponsive $Name
+        if ($retryExit -eq 0) {
+            Write-Host "[wsl] Docker in $Name recovered after bootstrap."
+            return
+        }
     }
 
     throw "Docker in '$Name' is still unresponsive after restarting the distro. Run 'pnpm.cmd dev:wsl:prune:dev' if the runtime is corrupted, or restart WSL and retry."
+}
+
+function Ensure-DevBuildToolchainReady([string]$Name) {
+    $probeCommand = @(
+        'if ! command -v node >/dev/null 2>&1; then'
+        '  exit 41'
+        'fi'
+        'node_major=$(node -v 2>/dev/null | sed ''s/^v//; s/\..*$//'' || echo 0)'
+        'if [ "${node_major:-0}" -lt 22 ]; then'
+        '  exit 44'
+        'fi'
+        'if ! command -v pnpm >/dev/null 2>&1; then'
+        '  exit 43'
+        'fi'
+        'pnpm --version >/dev/null 2>&1'
+        'if ! command -v cmake >/dev/null 2>&1; then'
+        '  exit 45'
+        'fi'
+    ) -join "`n"
+
+    Invoke-DistroRootBash $Name $probeCommand *> $null
+    if ($LASTEXITCODE -eq 0) {
+        return
+    }
+
+    Write-Host "[wsl] Bootstrapping Linux build toolchain inside $Name..."
+    $bootstrapCommand = @(
+        'set -euo pipefail'
+        'export DEBIAN_FRONTEND=noninteractive'
+        'if ! command -v apt-get >/dev/null 2>&1; then'
+        '  echo "apt-get is required to install the build toolchain in this distro." >&2'
+        '  exit 1'
+        'fi'
+        'apt-get update'
+        'apt-get install -y ca-certificates curl gnupg build-essential cmake git python3'
+        'need_node=1'
+        'if command -v node >/dev/null 2>&1; then'
+        '  node_major=$(node -v 2>/dev/null | sed ''s/^v//; s/\..*$//'' || echo 0)'
+        '  if [ "${node_major:-0}" -ge 22 ]; then'
+        '    need_node=0'
+        '  fi'
+        'fi'
+        'if [ "$need_node" -eq 1 ]; then'
+        '  mkdir -p /etc/apt/keyrings'
+        '  if [ ! -f /etc/apt/keyrings/nodesource.gpg ]; then'
+        '    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg'
+        '  fi'
+        '  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list'
+        '  apt-get update'
+        '  apt-get install -y nodejs'
+        'fi'
+        'if ! command -v pnpm >/dev/null 2>&1 || ! pnpm --version >/dev/null 2>&1; then'
+        '  if command -v corepack >/dev/null 2>&1; then'
+        '    corepack enable'
+        '    corepack prepare pnpm@10.23.0 --activate'
+        '  else'
+        '    npm install -g pnpm@10.23.0'
+        '  fi'
+        'fi'
+    ) -join "`n"
+
+    Invoke-DistroRootBash $Name $bootstrapCommand
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to bootstrap the Linux build toolchain in '$Name'. Verify network access in the distro and retry."
+    }
+
+    Invoke-DistroRootBash $Name $probeCommand *> $null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Linux build toolchain is still incomplete in '$Name' after bootstrap."
+    }
 }
 
 function Stop-Distro([string]$Name) {
@@ -341,6 +488,7 @@ switch ($cmd) {
             Start-Distro $target.Name
             if ($target.Mode -eq "dev") {
                 Ensure-DevDockerReady $target.Name
+                Ensure-DevBuildToolchainReady $target.Name
             }
         }
         Show-Status $targets

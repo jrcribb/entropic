@@ -231,7 +231,7 @@ if (-not (Test-RuntimeTarFresh $RuntimeTar)) {
     }
 
     Invoke-DevWslHelper -Command "start" -Mode "dev"
-    $BashCommand = "set -euo pipefail; ENTROPIC_BUILD_ALLOW_DOCKER_DESKTOP=1 ./scripts/build-openclaw-runtime.sh; ENTROPIC_BUILD_ALLOW_DOCKER_DESKTOP=1 ./scripts/bundle-runtime-image.sh"
+    $BashCommand = "set -euo pipefail; ./scripts/build-openclaw-runtime.sh; ./scripts/bundle-runtime-image.sh"
 
     Invoke-WslProjectBash -Command $BashCommand
     if ($LASTEXITCODE -ne 0) {

@@ -21,24 +21,11 @@ import {
 } from "../lib/auth";
 import { clientLog } from "../lib/clientLog";
 
-// Dynamic import for deep-link to handle when it's not available
-let onOpenUrl: ((callback: (urls: string[]) => void) => Promise<() => void>) | null = null;
-let listenTauriEvent:
-  | ((event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>)
-  | null = null;
-if (isAuthConfigured) {
-  try {
-    // @ts-ignore - module may not exist
-    import("@tauri-apps/plugin-deep-link").then((mod) => {
-      onOpenUrl = mod.onOpenUrl;
-    }).catch(() => {});
-    import("@tauri-apps/api/event").then((mod) => {
-      listenTauriEvent = mod.listen;
-    }).catch(() => {});
-  } catch {
-    // Deep link not available
-  }
-}
+type DeepLinkOnOpenUrl = (callback: (urls: string[]) => void) => Promise<() => void>;
+type TauriListenEvent = (
+  event: string,
+  handler: (event: { payload: unknown }) => void
+) => Promise<() => void>;
 
 interface AuthContextType {
   isLoading: boolean;
@@ -197,6 +184,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     let unlisten: (() => void) | undefined;
     let unlistenEvent: (() => void) | undefined;
     let unlistenLocalhost: (() => void) | undefined;
+    let disposed = false;
 
     async function handleUrls(urls: string[]) {
       for (const url of urls) {
@@ -227,29 +215,34 @@ export function AuthProvider({ children }: AuthProviderProps) {
       }
     }
 
-    async function setupDeepLink() {
-      if (!onOpenUrl) {
-        console.log("Deep link handler not available");
-        return;
-      }
-
+    async function setupDesktopAuthCallbacks() {
       try {
-        unlisten = await onOpenUrl(async (urls: string[]) => {
-          await handleUrls(urls);
-        });
-      } catch (error) {
-        console.error("Failed to setup deep link listener:", error);
-      }
-    }
+        const [deepLinkModule, eventModule] = await Promise.allSettled([
+          import("@tauri-apps/plugin-deep-link"),
+          import("@tauri-apps/api/event"),
+        ]);
 
-    setupDeepLink();
+        if (disposed) {
+          return;
+        }
 
-    async function setupSingleInstanceBridge() {
-      if (!listenTauriEvent) {
-        return;
-      }
+        const onOpenUrl: DeepLinkOnOpenUrl | null =
+          deepLinkModule.status === "fulfilled" ? deepLinkModule.value.onOpenUrl : null;
+        const listenTauriEvent: TauriListenEvent | null =
+          eventModule.status === "fulfilled" ? eventModule.value.listen : null;
 
-      try {
+        if (onOpenUrl) {
+          unlisten = await onOpenUrl(async (urls: string[]) => {
+            await handleUrls(urls);
+          });
+        } else {
+          console.log("Deep link handler not available");
+        }
+
+        if (!listenTauriEvent) {
+          return;
+        }
+
         unlistenEvent = await listenTauriEvent("deep-link-open", async (event) => {
           const payload = event.payload;
           if (Array.isArray(payload)) {
@@ -267,11 +260,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
           }
         });
       } catch (error) {
-        console.error("Failed to setup deep link event listener:", error);
+        console.error("Failed to setup desktop auth callback listeners:", error);
       }
     }
 
-    setupSingleInstanceBridge();
+    setupDesktopAuthCallbacks();
 
     // Handle OAuth callback with improved polling for production and dev
     const handleFocus = async () => {
@@ -349,6 +342,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     }, 1000);
 
     return () => {
+      disposed = true;
       unlisten?.();
       unlistenEvent?.();
       unlistenLocalhost?.();

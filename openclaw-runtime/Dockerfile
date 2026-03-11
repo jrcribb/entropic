@@ -102,23 +102,28 @@ RUN if [ -f /app/browser-service/package.json ]; then \
 # Fix clipboard module for ARM64 Linux (create stub)
 RUN echo "module.exports = { read: () => '', write: () => {}, readSync: () => '', writeSync: () => {}, clear: () => {}, clearSync: () => {} };" > /app/node_modules/.pnpm/@mariozechner+clipboard@0.3.0/node_modules/@mariozechner/clipboard/index.js || true
 
-# Fix sharp native bindings for Linux (node_modules copied from macOS build host).
-# pnpm-managed node_modules uses symlinks; npm install inside them is unreliable.
-# Detect the installed sharp version, fetch matching linux-arm64 bindings in a
-# temp dir, then copy them into sharp's @img directory.
+# Fix sharp native bindings for Linux when node_modules were materialized outside
+# the final image. Pick the linux binding that matches the image architecture
+# instead of assuming an arm64 host.
 RUN SHARP_PNPM="$(find /app/node_modules/.pnpm -maxdepth 1 -name 'sharp@*' -type d | head -1)" && \
     SHARP_VER="$(basename "$SHARP_PNPM" | sed 's/sharp@//')" && \
     SHARP_IMG_DIR="$SHARP_PNPM/node_modules/@img" && \
-    LIBVIPS_VER="$(ls -d /app/node_modules/.pnpm/@img+sharp-libvips-darwin-arm64@* 2>/dev/null | head -1 | sed 's/.*@//')" && \
-    echo "sharp=$SHARP_VER libvips=$LIBVIPS_VER img_dir=$SHARP_IMG_DIR" && \
-    if [ -d "$SHARP_IMG_DIR" ] && [ -n "$SHARP_VER" ]; then \
+    TARGET_ARCH="$(dpkg --print-architecture)" && \
+    case "$TARGET_ARCH" in \
+      amd64) SHARP_SUFFIX="linux-x64" ;; \
+      arm64) SHARP_SUFFIX="linux-arm64" ;; \
+      *) SHARP_SUFFIX="" ;; \
+    esac && \
+    LIBVIPS_VER="$(find /app/node_modules/.pnpm -maxdepth 1 -type d -name "@img+sharp-libvips-*@*" | head -1 | sed 's/.*@//')" && \
+    echo "sharp=$SHARP_VER libvips=$LIBVIPS_VER arch=$TARGET_ARCH suffix=$SHARP_SUFFIX img_dir=$SHARP_IMG_DIR" && \
+    if [ -d "$SHARP_IMG_DIR" ] && [ -n "$SHARP_VER" ] && [ -n "$SHARP_SUFFIX" ]; then \
       cd /tmp && mkdir sharp-fix && cd sharp-fix && \
       npm init -y --silent 2>/dev/null && \
-      npm install "@img/sharp-linux-arm64@$SHARP_VER" "@img/sharp-libvips-linux-arm64@${LIBVIPS_VER:-1.2.4}" 2>&1 && \
+      npm install "@img/sharp-$SHARP_SUFFIX@$SHARP_VER" "@img/sharp-libvips-$SHARP_SUFFIX@${LIBVIPS_VER:-1.2.4}" 2>&1 && \
       ls -la node_modules/@img/ && \
-      cp -a node_modules/@img/sharp-linux-arm64 "$SHARP_IMG_DIR/sharp-linux-arm64" && \
-      cp -a node_modules/@img/sharp-libvips-linux-arm64 "$SHARP_IMG_DIR/sharp-libvips-linux-arm64" && \
-      echo "Installed sharp linux-arm64 bindings into $SHARP_IMG_DIR" && \
+      cp -a "node_modules/@img/sharp-$SHARP_SUFFIX" "$SHARP_IMG_DIR/sharp-$SHARP_SUFFIX" && \
+      cp -a "node_modules/@img/sharp-libvips-$SHARP_SUFFIX" "$SHARP_IMG_DIR/sharp-libvips-$SHARP_SUFFIX" && \
+      echo "Installed sharp $SHARP_SUFFIX bindings into $SHARP_IMG_DIR" && \
       cd / && rm -rf /tmp/sharp-fix; \
     fi
 
