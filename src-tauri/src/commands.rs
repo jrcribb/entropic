@@ -9971,12 +9971,6 @@ pub async fn get_gateway_status(app: AppHandle) -> Result<bool, String> {
 
     if let Some(health_status) = container_health_status() {
         println!("[Entropic] Container health status: {}", health_status);
-        if health_status == "healthy" {
-            println!(
-                "[Entropic] Gateway WS probe failed but container health is healthy; treating as running.",
-            );
-            return Ok(true);
-        }
         if health_status == "starting" {
             println!(
                 "[Entropic] Gateway WS probe failed while container health is starting; reporting not running until WS recovers.",

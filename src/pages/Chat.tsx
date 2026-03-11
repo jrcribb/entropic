@@ -1634,6 +1634,11 @@ export function Chat({
     });
   }
 
+  function isTransientGatewayConnectState() {
+    const inStartupGracePeriod = Date.now() - componentMountedAt < 15_000;
+    return gatewayStarting || isConnecting || !gatewayRunning || inStartupGracePeriod;
+  }
+
   function clearActiveRunTracking() {
     activeRunIdRef.current = null;
     activeRunSessionRef.current = null;
@@ -1998,7 +2003,11 @@ export function Chat({
           addDiag(`active run interrupted by disconnect runId=${activeRunIdRef.current}`);
           clearActiveRunTracking();
         }
-        addDiag("gateway disconnected");
+        if (isTransientGatewayConnectState()) {
+          addDiag("gateway reconnect pending");
+        } else {
+          addDiag("gateway disconnected");
+        }
       };
       const onChat = (event: ChatEvent) => handleChatEvent(event);
       const onAgent = (event: AgentEvent) => handleAgentEvent(event);
@@ -2057,14 +2066,16 @@ export function Chat({
       } else {
         await client.connect();
       }
-    } catch (e) {
-      const inStartupGracePeriod = Date.now() - componentMountedAt < 15_000;
-      const errorMessage = e instanceof Error ? e.message : "Connection failed";
-      if (isGatewayAuthRateLimited(errorMessage)) {
-        applyGatewayAuthRateLimit(
-          errorMessage,
-          e instanceof GatewayError ? readGatewayRetryAfterMs(e.details) : null,
-        );
+      } catch (e) {
+        const inStartupGracePeriod = Date.now() - componentMountedAt < 15_000;
+        const errorMessage = e instanceof Error ? e.message : "Connection failed";
+        const suppressConnectDiag =
+          gatewayStarting || !gatewayRunning || inStartupGracePeriod;
+        if (isGatewayAuthRateLimited(errorMessage)) {
+          applyGatewayAuthRateLimit(
+            errorMessage,
+            e instanceof GatewayError ? readGatewayRetryAfterMs(e.details) : null,
+          );
       } else if (!gatewayStarting && !inStartupGracePeriod) {
         setError(errorMessage);
       }
@@ -2072,7 +2083,14 @@ export function Chat({
         setLastGatewayError(errorMessage);
       }
       setIsConnecting(false);
-      addDiag(`connect failed: ${errorMessage}${inStartupGracePeriod ? ' (suppressed: startup grace period)' : ''}`);
+      if (
+        suppressConnectDiag &&
+        errorMessage.includes("Gateway socket closed during connect")
+      ) {
+        addDiag("gateway connect retry pending");
+      } else {
+        addDiag(`connect failed: ${errorMessage}${inStartupGracePeriod ? ' (suppressed: startup grace period)' : ''}`);
+      }
     } finally {
       connectInFlightRef.current = false;
     }
