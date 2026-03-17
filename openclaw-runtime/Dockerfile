@@ -122,6 +122,30 @@ RUN SHARP_PNPM="$(find /app/node_modules/.pnpm -maxdepth 1 -name 'sharp@*' -type
       cd / && rm -rf /tmp/sharp-fix; \
     fi
 
+# Fix @snazzah/davey native bindings for Linux when node_modules were
+# materialized on macOS. The optional platform package is selected at install
+# time, so copying host node_modules into the runtime image can miss the Linux
+# binary entirely and cause the gateway to crash on boot.
+RUN DAVEY_PNPM="$(find /app/node_modules/.pnpm -maxdepth 1 -name '@snazzah+davey@*' -type d | head -1)" && \
+    DAVEY_VER="$(basename "$DAVEY_PNPM" | sed 's/@snazzah+davey@//')" && \
+    DAVEY_SCOPE_DIR="/app/node_modules/.pnpm/node_modules/@snazzah" && \
+    TARGET_ARCH="$(dpkg --print-architecture)" && \
+    case "$TARGET_ARCH" in \
+      amd64) DAVEY_SUFFIX="linux-x64-gnu" ;; \
+      arm64) DAVEY_SUFFIX="linux-arm64-gnu" ;; \
+      *) DAVEY_SUFFIX="" ;; \
+    esac && \
+    echo "davey=$DAVEY_VER arch=$TARGET_ARCH suffix=$DAVEY_SUFFIX scope_dir=$DAVEY_SCOPE_DIR" && \
+    if [ -d "$DAVEY_SCOPE_DIR" ] && [ -n "$DAVEY_VER" ] && [ -n "$DAVEY_SUFFIX" ]; then \
+      cd /tmp && mkdir davey-fix && cd davey-fix && \
+      npm init -y --silent 2>/dev/null && \
+      npm install "@snazzah/davey-$DAVEY_SUFFIX@$DAVEY_VER" 2>&1 && \
+      mkdir -p "$DAVEY_SCOPE_DIR" && \
+      cp -a "node_modules/@snazzah/davey-$DAVEY_SUFFIX" "$DAVEY_SCOPE_DIR/davey-$DAVEY_SUFFIX" && \
+      echo "Installed davey $DAVEY_SUFFIX binding into $DAVEY_SCOPE_DIR" && \
+      cd / && rm -rf /tmp/davey-fix; \
+    fi
+
 # Switch to non-root user
 USER node
 
