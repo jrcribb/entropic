@@ -4360,6 +4360,8 @@ const LEGACY_OPENCLAW_NETWORK: &str = "nova-net";
 const OPENCLAW_DATA_VOLUME: &str = "entropic-openclaw-data";
 const LEGACY_OPENCLAW_DATA_VOLUME: &str = "nova-openclaw-data";
 const SCANNER_CONTAINER: &str = "entropic-skill-scanner";
+const CLAWHUB_NPM_VERSION: &str = "0.9.0";
+const CLAWHUB_JSON5_VERSION: &str = "2.2.3";
 const SCANNER_HOST_PORT: &str = "19791";
 const ENTROPIC_GATEWAY_SCHEMA_VERSION: &str = "2026-02-13";
 const OPENCLAW_STATE_ROOT: &str = "/home/node/.openclaw";
@@ -5258,6 +5260,17 @@ fn resolve_installed_skill_dir(skill_id: &str) -> Result<Option<String>, String>
         return Ok(Some(dir));
     }
 
+    if let Some(skills_root) = read_container_env("ENTROPIC_SKILLS_PATH") {
+        let base = format!("{}/{}", skills_root.trim_end_matches('/'), skill_id);
+        let current = format!("{}/current", base);
+        if container_dir_exists(&current)? {
+            return Ok(Some(current));
+        }
+        if container_dir_exists(&base)? {
+            return Ok(Some(base));
+        }
+    }
+
     for legacy_root in LEGACY_SKILLS_ROOTS {
         let legacy_path = format!("{}/{}", legacy_root.trim_end_matches('/'), skill_id);
         if container_dir_exists(&legacy_path)? {
@@ -5269,6 +5282,9 @@ fn resolve_installed_skill_dir(skill_id: &str) -> Result<Option<String>, String>
 
 fn collect_skill_ids() -> Result<Vec<String>, String> {
     let mut ids = list_container_subdirs(SKILLS_ROOT)?;
+    if let Some(skills_root) = read_container_env("ENTROPIC_SKILLS_PATH") {
+        ids.extend(list_container_subdirs(skills_root.trim_end_matches('/'))?);
+    }
     for legacy_root in LEGACY_SKILLS_ROOTS {
         ids.extend(list_container_subdirs(legacy_root)?);
     }
@@ -5712,17 +5728,27 @@ fn clawhub_exec(args: &[&str]) -> Result<Output, String> {
     // Install clawhub into the persistent /data/.local prefix and self-heal
     // stale/broken installs before invoking it. `command -v clawhub` is not
     // sufficient because npm can leave behind a binary shim while required dist
-    // files are missing, which surfaces later as ERR_MODULE_NOT_FOUND.
-    let mut shell_cmd = String::from(
+    // files are missing, which surfaces later as ERR_MODULE_NOT_FOUND. We also
+    // upgrade older-but-intact installs so production users recover when the
+    // ClawHub backend moves ahead of the previously bundled CLI.
+    let mut shell_cmd = format!(
         "CLAWHUB_BIN=/data/.local/bin/clawhub; \
+         CLAWHUB_PKG=/data/.local/lib/node_modules/clawhub/package.json; \
          CLAWHUB_DIST=/data/.local/lib/node_modules/clawhub/dist/cli.js; \
          CLAWHUB_BUILDINFO=/data/.local/lib/node_modules/clawhub/dist/cli/buildInfo.js; \
          CLAWHUB_JSON5=/data/.local/lib/node_modules/json5/package.json; \
-         if [ ! -x \"$CLAWHUB_BIN\" ] || [ ! -f \"$CLAWHUB_DIST\" ] || [ ! -f \"$CLAWHUB_BUILDINFO\" ] || [ ! -f \"$CLAWHUB_JSON5\" ]; then \
+         EXPECTED_CLAWHUB_VERSION=\"{expected_version}\"; \
+         INSTALLED_CLAWHUB_VERSION=\"\"; \
+         if [ -f \"$CLAWHUB_PKG\" ]; then \
+           INSTALLED_CLAWHUB_VERSION=$(node -e 'try {{ process.stdout.write(require(process.argv[1]).version || \"\") }} catch {{}}' \"$CLAWHUB_PKG\" 2>/dev/null || true); \
+         fi; \
+         if [ ! -x \"$CLAWHUB_BIN\" ] || [ ! -f \"$CLAWHUB_DIST\" ] || [ ! -f \"$CLAWHUB_BUILDINFO\" ] || [ ! -f \"$CLAWHUB_JSON5\" ] || [ \"$INSTALLED_CLAWHUB_VERSION\" != \"$EXPECTED_CLAWHUB_VERSION\" ]; then \
            rm -rf /data/.local/lib/node_modules/clawhub /data/.local/lib/node_modules/json5 /data/.local/bin/clawhub /data/.local/bin/clawdhub; \
-           npm install -g --prefix /data/.local clawhub@0.7.0 json5@2.2.3; \
+           npm install -g --no-audit --no-fund --prefix /data/.local clawhub@{expected_version} json5@{json5_version}; \
          fi; \
          exec node \"$CLAWHUB_DIST\"",
+        expected_version = CLAWHUB_NPM_VERSION,
+        json5_version = CLAWHUB_JSON5_VERSION,
     );
     for arg in args {
         shell_cmd.push(' ');
@@ -5761,9 +5787,11 @@ fn clawhub_output_suggests_broken_install(output: &Output) -> bool {
 }
 
 fn repair_clawhub_install() {
-    let repair_cmd =
+    let repair_cmd = format!(
         "rm -rf /data/.local/lib/node_modules/clawhub /data/.local/lib/node_modules/json5 /data/.local/bin/clawhub /data/.local/bin/clawdhub && \
-         npm install -g --prefix /data/.local clawhub@0.7.0 json5@2.2.3";
+         npm install -g --no-audit --no-fund --prefix /data/.local clawhub@{} json5@{}",
+        CLAWHUB_NPM_VERSION, CLAWHUB_JSON5_VERSION
+    );
     let _ = docker_exec_output(&[
         "exec",
         OPENCLAW_CONTAINER,
@@ -5776,7 +5804,7 @@ fn repair_clawhub_install() {
         "PLAYWRIGHT_BROWSERS_PATH=/data/playwright",
         "sh",
         "-c",
-        repair_cmd,
+        &repair_cmd,
     ]);
 }
 
@@ -9072,10 +9100,6 @@ Use it for durable decisions, preferences, and facts that should persist across 
     }
 
     let resolve_managed_plugin_path = |plugin_id: &str| -> Option<String> {
-        let bundled_path = format!("/app/extensions/{}", plugin_id);
-        if container_path_exists(&bundled_path) {
-            return Some(bundled_path);
-        }
         if let Some(skills_root) = read_container_env("ENTROPIC_SKILLS_PATH") {
             let base = format!("{}/{}", skills_root.trim_end_matches('/'), plugin_id);
             let current = format!("{}/current", base);
@@ -9087,6 +9111,10 @@ Use it for durable decisions, preferences, and facts that should persist across 
             if container_path_exists(&candidate) {
                 return Some(candidate);
             }
+        }
+        let bundled_path = format!("/app/extensions/{}", plugin_id);
+        if container_path_exists(&bundled_path) {
+            return Some(bundled_path);
         }
         None
     };
@@ -9131,6 +9159,9 @@ Use it for durable decisions, preferences, and facts that should persist across 
             &["plugins", "entries", plugin_id, "enabled"],
             serde_json::json!(true),
         );
+        if bundled_plugin_entry_exists(plugin_id) {
+            remove_bundled_plugin_load_paths(&mut cfg, plugin_id);
+        }
         if let Some(path) = resolve_managed_plugin_path(plugin_id) {
             ensure_plugin_load_path(&mut cfg, path);
         }
@@ -9144,6 +9175,9 @@ Use it for durable decisions, preferences, and facts that should persist across 
             &["plugins", "entries", "entropic-quai-builder", "enabled"],
             serde_json::json!(true),
         );
+        if bundled_plugin_entry_exists("entropic-quai-builder") {
+            remove_bundled_plugin_load_paths(&mut cfg, "entropic-quai-builder");
+        }
         if let Some(path) = resolve_managed_plugin_path("entropic-quai-builder") {
             ensure_plugin_load_path(&mut cfg, path);
         }

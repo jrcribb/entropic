@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNTIME_COMMON="$SCRIPT_DIR/runtime-common.sh"
+DEFAULT_ENTROPIC_SKILLS_PATH="$PROJECT_ROOT/../entropic-skills"
 
 if [ ! -f "$RUNTIME_COMMON" ]; then
   echo "ERROR: Missing runtime helper: $RUNTIME_COMMON" >&2
@@ -276,6 +277,12 @@ up_stack() {
   ensure_runtime_images
   ensure_runtime_tars
   local build_profile="${ENTROPIC_BUILD_PROFILE:-local}"
+  local skills_path="${ENTROPIC_SKILLS_PATH:-}"
+
+  if [ -z "$skills_path" ] && [ -d "$DEFAULT_ENTROPIC_SKILLS_PATH" ]; then
+    skills_path="$DEFAULT_ENTROPIC_SKILLS_PATH"
+    echo "[dev] Using local entropic-skills: $skills_path"
+  fi
 
   for container in entropic-openclaw nova-openclaw; do
     local stopped_ids
@@ -289,6 +296,7 @@ up_stack() {
   ENTROPIC_RUNTIME_MODE=dev \
   ENTROPIC_BUILD_PROFILE="$build_profile" \
   ENTROPIC_COLIMA_HOME="$ENTROPIC_COLIMA_HOME" \
+  ENTROPIC_SKILLS_PATH="$skills_path" \
   DOCKER_HOST="$ACTIVE_DOCKER_HOST" \
     pnpm tauri:dev
 }

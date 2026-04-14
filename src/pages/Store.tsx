@@ -1389,6 +1389,13 @@ export function Store({
                   <div className="bg-red-500/10 border border-red-500/20 rounded-xl p-8 text-center text-red-500">
                     <p className="font-semibold">{clawhubLookupError}</p>
                   </div>
+                ) : browseSkills.length === 0 ? (
+                  <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-card)] p-8 text-center">
+                    <p className="font-semibold text-[var(--text-primary)]">No browse results from ClawHub right now.</p>
+                    <p className="mt-2 text-sm text-[var(--text-secondary)]">
+                      Featured skills are still available above, and search should continue to work.
+                    </p>
+                  </div>
                 ) : (
                   <>
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -1518,7 +1525,7 @@ export function Store({
                       <button
                         type="button"
                         onClick={() => {
-                          void open(`https://clawhub.org/skills/${clawhubDetailModalSlug}`);
+                          void open(`https://clawhub.ai/skills/${clawhubDetailModalSlug}`);
                         }}
                         className="inline-flex items-center gap-1.5 text-xs font-semibold text-[var(--system-blue)] hover:underline"
                       >

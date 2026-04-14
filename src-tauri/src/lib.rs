@@ -92,8 +92,8 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     }
 
-    builder
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+    if !cfg!(debug_assertions) {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             let urls: Vec<String> = args
                 .into_iter()
                 .filter(|arg| arg.starts_with("entropic://") || arg.starts_with("entropic-dev://"))
@@ -109,7 +109,10 @@ pub fn run() {
             }
 
             let _ = app.emit("deep-link-open", urls);
-        }))
+        }));
+    }
+
+    builder
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -137,6 +140,13 @@ pub fn run() {
 
             let state = commands::init_state(app.handle());
             app.manage(state);
+
+            #[cfg(debug_assertions)]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -277,16 +287,26 @@ pub fn run() {
                 ..
             } => {
                 // On macOS, closing window should just hide it (keep app running in dock)
-                // Only stop containers on actual app quit (Cmd+Q)
+                // Only stop containers on actual app quit (Cmd+Q). In debug/dev,
+                // prefer quitting so repeated `tauri dev` launches do not bounce
+                // off a hidden single-instance process.
                 #[cfg(target_os = "macos")]
                 {
-                    println!(
-                        "[Entropic] Window close requested — hiding window (containers stay running)"
-                    );
-                    if let Some(window) = app_handle.get_webview_window(&label) {
-                        let _ = window.hide();
+                    if cfg!(debug_assertions) {
+                        println!(
+                            "[Entropic] Window close requested in debug — exiting app for clean relaunches"
+                        );
+                        let _ = (&label, &api);
+                        commands::cleanup_on_exit();
+                    } else {
+                        println!(
+                            "[Entropic] Window close requested — hiding window (containers stay running)"
+                        );
+                        if let Some(window) = app_handle.get_webview_window(&label) {
+                            let _ = window.hide();
+                        }
+                        api.prevent_close();
                     }
-                    api.prevent_close();
                 }
 
                 // On other platforms, closing window exits the app
