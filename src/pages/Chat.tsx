@@ -4281,6 +4281,18 @@ export function Chat({
     if (!runId || !sessionKey) return;
     if (runHistoryRecoveryRef.current[runId]) return;
 
+    const isRecoveryBoundaryUserMessage = (item: GatewayMessage): boolean => {
+      const role = typeof item?.role === "string" ? item.role.toLowerCase() : "";
+      if (role !== "user") return false;
+      const { text, hasText, hasNonText } = extractMessageText(item);
+      const trimmed = text.trim();
+      if (!hasText) return hasNonText;
+      if (trimmed.startsWith(INTERNAL_USER_PROMPT_PREFIX)) return false;
+      if (/^pre-compaction memory flush\b/i.test(trimmed)) return false;
+      if (/^please summarize the conversation\b/i.test(trimmed)) return false;
+      return true;
+    };
+
     runHistoryRecoveryRef.current[runId] = true;
     setIsLoading(true);
     try {
@@ -4305,7 +4317,15 @@ export function Chat({
 
         try {
           const history = await client.getChatHistory(sessionKey, 40);
-          const fallback = [...history].reverse().find((item) => {
+          let latestUserIdx = -1;
+          for (let i = history.length - 1; i >= 0; i -= 1) {
+            if (isRecoveryBoundaryUserMessage(history[i] as GatewayMessage)) {
+              latestUserIdx = i;
+              break;
+            }
+          }
+          const recoveryWindow = latestUserIdx >= 0 ? history.slice(latestUserIdx + 1) : history;
+          const fallback = [...recoveryWindow].reverse().find((item) => {
             const role = typeof item?.role === "string" ? item.role.toLowerCase() : "";
             if (role !== "assistant" && role !== "toolresult" && role !== "tool_result" && role !== "tool") {
               return false;

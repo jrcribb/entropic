@@ -311,6 +311,65 @@ const fs = require("fs");
 const path = require("path");
 
 const distDir = "/app/dist";
+const contextFile = fs.readdirSync(distDir).find((file) => /^model-context-tokens-.*\.js$/.test(file));
+if (!contextFile) throw new Error("model-context-tokens bundle not found");
+const filePath = path.join(distDir, contextFile);
+let source = fs.readFileSync(filePath, "utf8");
+
+if (!source.includes("function stripEntropicAudioTranscriptPayloads(messages)")) {
+	source = source.replace(
+		"function estimateMessageChars$1(msg) {",
+		`function isEntropicAudioContentBlock(block) {
+\treturn !!block && typeof block === "object" && (block.type === "audio" || block.type === "input_audio");
+}
+function stripEntropicAudioTranscriptPayloads(messages) {
+\tif (!Array.isArray(messages) || messages.length === 0) return messages;
+\tlet changed = false;
+\tconst stripped = [];
+\tfor (const message of messages) {
+\t\tif (!message || typeof message !== "object" || !Array.isArray(message.content)) {
+\t\t\tstripped.push(message);
+\t\t\tcontinue;
+\t\t}
+\t\tconst nextContent = message.content.filter((block) => !isEntropicAudioContentBlock(block));
+\t\tif (nextContent.length === message.content.length) {
+\t\t\tstripped.push(message);
+\t\t\tcontinue;
+\t\t}
+\t\tchanged = true;
+\t\tconst visibleText = nextContent.map((block) => block && typeof block === "object" && block.type === "text" && typeof block.text === "string" ? block.text : "").join("").trim();
+\t\tif (nextContent.length === 0) continue;
+\t\tif (message.role === "assistant" && /^Audio reply$/i.test(visibleText)) continue;
+\t\tstripped.push({ ...message, content: nextContent });
+\t}
+\treturn changed ? stripped : messages;
+}
+function estimateMessageChars$1(msg) {`
+	);
+	source = source.replaceAll(
+		"else chars += estimateUnknownChars(block);",
+		"else if (isEntropicAudioContentBlock(block)) chars += 128;\n\t\telse chars += estimateUnknownChars(block);"
+	);
+	source = source.replace(
+		"const withInterSessionMarkers = annotateInterSessionUserMessages(params.messages);",
+		"const withInterSessionMarkers = annotateInterSessionUserMessages(stripEntropicAudioTranscriptPayloads(params.messages));"
+	);
+}
+for (const required of [
+	"function stripEntropicAudioTranscriptPayloads(messages)",
+	"if (message.role === \"assistant\" && /^Audio reply$/i.test(visibleText)) continue;",
+	"stripEntropicAudioTranscriptPayloads(params.messages)"
+]) {
+	if (!source.includes(required)) throw new Error(`Audio transcript replay sanitization patch missed: ${required}`);
+}
+fs.writeFileSync(filePath, source);
+NODE
+
+RUN node <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const distDir = "/app/dist";
 const runnerFile = fs.readdirSync(distDir).find((file) => /^pi-embedded-runner-.*\.js$/.test(file));
 if (!runnerFile) throw new Error("pi-embedded-runner bundle not found");
 const filePath = path.join(distDir, runnerFile);

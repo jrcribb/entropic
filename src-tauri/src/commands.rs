@@ -8555,6 +8555,9 @@ fn build_tools_markdown(capabilities: &[CapabilityState]) -> String {
             "- Use the `browser` tool with actions such as `open`, `navigate`, and `snapshot`; for example open `https://www.weather.gov/` or a search/weather page, then snapshot it and answer from the page.\n",
         );
         body.push_str(
+            "- If `browser` fails with a strict SSRF/IP-literal/hostname navigation block for a public HTTPS site, use `exec` with a simple network command such as `curl -L --max-time 20 <url>` as the fallback lookup path, then answer from that result.\n",
+        );
+        body.push_str(
             "- Do not look for Patchright skill files under `~/.openclaw`, `/data/workspace/skills`, or `/data/skills`; those paths are not the browser tool. If `browser` is available, use `browser` directly.\n",
         );
         body.push_str(
