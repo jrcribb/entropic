@@ -1316,7 +1316,7 @@ export function Store({
           : null;
         return {
           ...integration,
-          configured: entry ? entry.configured ?? integration.configured : false,
+          configured: entry ? entry.configured ?? integration.configured : integration.configured,
           connected: Boolean(entry && entry.connected && !entry.stale),
           stale: entry?.stale,
           email: entry?.email,
@@ -1329,7 +1329,7 @@ export function Store({
     () =>
       integrationsLoaded
         ? hostedOauthCatalog.filter((integration) => integration.configured !== false)
-        : [],
+        : hostedOauthCatalog,
     [hostedOauthCatalog, integrationsLoaded]
   );
 

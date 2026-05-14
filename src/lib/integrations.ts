@@ -328,16 +328,21 @@ export async function connectIntegration(
         message: err instanceof Error ? err.message : String(err),
         data: apiError?.data ?? null,
       });
-      const detail =
-        apiError?.data?.error?.message ||
-        apiError?.data?.message ||
-        apiError?.data?.raw ||
-        (err instanceof Error ? err.message : String(err));
-      throw new Error(
-        detail && detail !== "Failed to initiate integration link"
-          ? `${detail}`
-          : `${provider} is not available for hosted OAuth yet. The hosted integration may be unconfigured on the API.`
-      );
+	      const detail =
+	        apiError?.data?.error?.message ||
+	        apiError?.data?.message ||
+	        apiError?.data?.raw ||
+	        (err instanceof Error ? err.message : String(err));
+	      if (detail === "Failed to initiate integration link") {
+	        throw new Error(
+	          "Failed to initiate hosted integration link. Check the hosted API logs and Supabase hosted integration migrations."
+	        );
+	      }
+	      throw new Error(
+	        detail
+	          ? `${detail}`
+	          : `${provider} is not available for hosted OAuth yet. The hosted integration may be unconfigured on the API.`
+	      );
     }
     if (result?.url) {
       try {
