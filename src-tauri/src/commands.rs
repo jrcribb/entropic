@@ -11086,13 +11086,20 @@ Use it for durable decisions, preferences, and facts that should persist across 
     }
 
     // Ensure optional plugin tools are allowed without restricting core tools.
-    const ENTROPIC_INTEGRATION_TOOLS: [&str; 6] = [
+    const ENTROPIC_INTEGRATION_TOOLS: [&str; 13] = [
         "calendar_list",
         "calendar_create",
         "gmail_search",
         "gmail_get",
         "gmail_send",
         "gmail_draft",
+        "outlook_mail_folders_list",
+        "outlook_messages_list",
+        "outlook_message_get",
+        "outlook_message_send",
+        "outlook_calendars_list",
+        "outlook_events_list",
+        "outlook_event_create",
     ];
     const ENTROPIC_X_TOOLS: [&str; 4] = ["x_search", "x_profile", "x_thread", "x_user_tweets"];
     const ENTROPIC_CORE_TOOLS: [&str; 1] = ["image"];

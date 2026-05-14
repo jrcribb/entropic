@@ -1757,6 +1757,15 @@ function parseGmailIntent(raw: string): boolean {
   return mentionsGmail || mentionsInbox || mentionsComposioGmail || mentionsGenericMail;
 }
 
+function parseOutlookIntent(raw: string): boolean {
+  const text = raw.trim().toLowerCase();
+  if (!text) return false;
+  return (
+    /\b(?:outlook|microsoft\s+mail|office\s*365\s+mail)\b/.test(text) ||
+    (/\bcomposio\b/.test(text) && /\b(?:outlook|microsoft|office\s*365)\b/.test(text))
+  );
+}
+
 export function Chat({
   isVisible,
   gatewayRunning,
@@ -5871,9 +5880,42 @@ export function Chat({
         ? extractWorkspaceOfficeFileName(messageContent)
         : null;
 
+    const outlookIntent =
+      !xIntent &&
+      !workspaceOfficeIntent &&
+      shouldCheckXIntent &&
+      parseOutlookIntent(messageContent);
+    if (outlookIntent && sendSession) {
+      try {
+        const connectedNow = await isIntegrationReady("outlook");
+        if (!connectedNow) {
+          addDiag("outlook intent detected; Outlook integration not connected");
+          appendAssistantNotice(
+            "I can do that with Outlook, but it is not connected yet. Connect Outlook in Integrations, then try again.",
+            sendSession
+          );
+          return;
+        }
+      } catch {
+        appendAssistantNotice("Failed to check Outlook integration status.", sendSession);
+        return;
+      }
+
+      outboundMessageContent = [
+        "Use the connected Outlook integration for this request.",
+        "Available Outlook tools: `outlook_messages_list` for inbox/message lists, `outlook_message_get` for reading a specific message, `outlook_message_send` for sending mail, and `outlook_mail_folders_list` for folders.",
+        "For calendar requests, use `outlook_calendars_list`, `outlook_events_list`, and `outlook_event_create`.",
+        "Do not say Outlook or Composio is unavailable unless an Outlook tool call actually fails.",
+        "For inbox/list/summarize requests, start with `outlook_messages_list` using limit 10.",
+        `Original user request: ${messageContent.trim()}`,
+      ].join("\n");
+      addDiag("outlook intent detected; routing via Outlook integration");
+    }
+
     const gmailIntent =
       !xIntent &&
       !workspaceOfficeIntent &&
+      !outlookIntent &&
       shouldCheckXIntent &&
       parseGmailIntent(messageContent);
     if (gmailIntent && sendSession) {

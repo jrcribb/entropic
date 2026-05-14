@@ -142,28 +142,18 @@ const fs = require("fs");
 const path = require("path");
 
 const distDir = "/app/dist";
-const streamFile = fs.readdirSync(distDir).find((file) => /^anthropic-vertex-stream-.*\.js$/.test(file));
-if (!streamFile) throw new Error("anthropic-vertex-stream bundle not found");
-const filePath = path.join(distDir, streamFile);
-let source = fs.readFileSync(filePath, "utf8");
-source = source.replace(
-	"} else if (hasToolHistory(context.messages)) params.tools = [];",
-	"}"
-);
-source = source.replace(
-	"if (context.tools) params.tools = convertAnthropicTools(context.tools, isOAuthToken);",
-	"if (context.tools?.length) params.tools = convertAnthropicTools(context.tools, isOAuthToken);"
-);
-source = source.replace(
-	"if (context.tools) params.tools = convertResponsesTools(context.tools, { strict: resolveOpenAIStrictToolSetting(model, { transport: \"stream\" }) });",
-	"if (context.tools?.length) params.tools = convertResponsesTools(context.tools, { strict: resolveOpenAIStrictToolSetting(model, { transport: \"stream\" }) });"
-);
-source = source.replace(
-	"if (context.tools) {\n\t\tparams.tools = convertTools(context.tools, compat, model);",
-	"if (context.tools?.length) {\n\t\tparams.tools = convertTools(context.tools, compat, model);"
-);
-source = source.replace(
-	`function convertTools(tools, compat, model) {
+function walkJs(dir) {
+	const out = [];
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) out.push(...walkJs(full));
+		else if (entry.isFile() && entry.name.endsWith(".js")) out.push(full);
+	}
+	return out;
+}
+const toolConverterReplacements = [
+	[
+		`function convertTools(tools, compat, model) {
 \tconst strict = resolveOpenAIStrictToolFlagForInventory(tools, resolveOpenAIStrictToolSetting(model, {
 \t\ttransport: "stream",
 \t\tsupportsStrictMode: compat?.supportsStrictMode
@@ -178,7 +168,7 @@ source = source.replace(
 \t\t}
 \t}));
 }`,
-	`function convertTools(tools, compat, model) {
+		`function convertTools(tools, compat, model) {
 \tconst strict = resolveOpenAIStrictToolFlagForInventory(tools, resolveOpenAIStrictToolSetting(model, {
 \t\ttransport: "stream",
 \t\tsupportsStrictMode: compat?.supportsStrictMode
@@ -204,22 +194,93 @@ source = source.replace(
 \t\treturn converted;
 \t});
 }`
-);
-for (const forbidden of [
-	"} else if (hasToolHistory(context.messages)) params.tools = [];",
-	"if (context.tools) params.tools = convertAnthropicTools(context.tools, isOAuthToken);",
-	"if (context.tools) params.tools = convertResponsesTools(context.tools, { strict: resolveOpenAIStrictToolSetting(model, { transport: \"stream\" }) });",
-	"if (context.tools) {\n\t\tparams.tools = convertTools(context.tools, compat, model);"
-]) {
-	if (source.includes(forbidden)) throw new Error(`Venice empty-tools compatibility patch missed: ${forbidden}`);
+	],
+	[
+		`function convertTools(tools, compat, model) {
+\tconst strict = resolveOpenAIStrictToolFlagWithDiagnostics(tools, resolveOpenAIStrictToolSetting(model, {
+\t\ttransport: "stream",
+\t\tsupportsStrictMode: compat?.supportsStrictMode
+\t}), {
+\t\ttransport: "completions",
+\t\tmodel
+\t});
+\treturn tools.map((tool) => ({
+\t\ttype: "function",
+\t\tfunction: {
+\t\t\tname: tool.name,
+\t\t\tdescription: tool.description,
+\t\t\tparameters: normalizeOpenAIStrictToolParameters(tool.parameters, strict === true),
+\t\t\t...strict === void 0 ? {} : { strict }
+\t\t}
+\t}));
+}`,
+		`function convertTools(tools, compat, model) {
+\tconst strict = resolveOpenAIStrictToolFlagWithDiagnostics(tools, resolveOpenAIStrictToolSetting(model, {
+\t\ttransport: "stream",
+\t\tsupportsStrictMode: compat?.supportsStrictMode
+\t}), {
+\t\ttransport: "completions",
+\t\tmodel
+\t});
+\treturn tools.map((tool) => {
+\t\tconst converted = {
+\t\t\ttype: "function",
+\t\t\tfunction: {
+\t\t\t\tname: tool.name,
+\t\t\t\tdescription: tool.description,
+\t\t\t\tparameters: normalizeOpenAIStrictToolParameters(tool.parameters, strict === true),
+\t\t\t\t...strict === void 0 ? {} : { strict }
+\t\t\t}
+\t\t};
+\t\tObject.defineProperty(converted, "name", { value: tool.name });
+\t\tObject.defineProperty(converted, "run", {
+\t\t\tvalue: async (input) => {
+\t\t\t\tif (typeof tool.run === "function") return await tool.run(input);
+\t\t\t\tif (typeof tool.execute === "function") return await tool.execute("run_" + randomUUID(), input);
+\t\t\t\tthrow new Error("Tool has no executable handler");
+\t\t\t}
+\t\t});
+\t\treturn converted;
+\t});
+}`
+	]
+];
+let emptyToolsPatchCount = 0;
+let runPatchCount = 0;
+for (const filePath of walkJs(distDir)) {
+	let source = fs.readFileSync(filePath, "utf8");
+	const before = source;
+	source = source.replaceAll(
+		"} else if (hasToolHistory(context.messages)) params.tools = [];",
+		"}"
+	);
+	source = source.replaceAll(
+		"if (context.tools) params.tools = convertAnthropicTools(context.tools, isOAuthToken);",
+		"if (context.tools?.length) params.tools = convertAnthropicTools(context.tools, isOAuthToken);"
+	);
+	source = source.replaceAll(
+		"if (context.tools) params.tools = convertResponsesTools(context.tools, model, { strict: resolveOpenAIStrictToolSetting(model, { transport: \"stream\" }) });",
+		"if (context.tools?.length) params.tools = convertResponsesTools(context.tools, model, { strict: resolveOpenAIStrictToolSetting(model, { transport: \"stream\" }) });"
+	);
+	source = source.replaceAll(
+		"if (context.tools) {\n\t\tparams.tools = convertTools(context.tools, compat, model);",
+		"if (context.tools?.length) {\n\t\tparams.tools = convertTools(context.tools, compat, model);"
+	);
+	for (const [from, to] of toolConverterReplacements) {
+		if (source.includes(from)) {
+			source = source.replace(from, to);
+			runPatchCount++;
+		}
+	}
+	if (source !== before) {
+		if (!before.includes("Object.defineProperty(converted, \"run\"") && source.includes("Object.defineProperty(converted, \"run\"")) runPatchCount++;
+		emptyToolsPatchCount++;
+		fs.writeFileSync(filePath, source);
+	}
 }
-for (const required of [
-	"Object.defineProperty(converted, \"name\"",
-	"Object.defineProperty(converted, \"run\""
-]) {
-	if (!source.includes(required)) throw new Error(`Venice OpenAI tool runner compatibility patch missed: ${required}`);
+if (emptyToolsPatchCount === 0) {
+	throw new Error("Venice empty-tools compatibility patch did not match any dist file");
 }
-fs.writeFileSync(filePath, source);
 NODE
 
 RUN node <<'NODE'
@@ -227,19 +288,29 @@ const fs = require("fs");
 const path = require("path");
 
 const distDir = "/app/dist";
-const contextFile = fs.readdirSync(distDir).find((file) => /^model-context-tokens-.*\.js$/.test(file));
-if (!contextFile) throw new Error("model-context-tokens bundle not found");
-const filePath = path.join(distDir, contextFile);
-let source = fs.readFileSync(filePath, "utf8");
-source = source.replace(
-	`function splitSdkTools(options) {
+function walkJs(dir) {
+	const out = [];
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) out.push(...walkJs(full));
+		else if (entry.isFile() && entry.name.endsWith(".js")) out.push(full);
+	}
+	return out;
+}
+let splitPatchCount = 0;
+let runPatchCount = 0;
+for (const filePath of walkJs(distDir)) {
+	let source = fs.readFileSync(filePath, "utf8");
+	const before = source;
+	source = source.replace(
+		`function splitSdkTools(options) {
 \tconst { tools } = options;
 \treturn {
 \t\tbuiltInTools: [],
 \t\tcustomTools: toToolDefinitions(tools)
 \t};
 }`,
-	`function splitSdkTools(options) {
+		`function splitSdkTools(options) {
 \tconst { tools } = options;
 \tconst definitions = toToolDefinitions(tools);
 \treturn {
@@ -247,12 +318,28 @@ source = source.replace(
 \t\tcustomTools: definitions
 \t};
 }`
-);
-const marker = "const beforeHookWrapped = isToolWrappedWithBeforeToolCallHook(tool);";
-if (!source.includes("function normalizeEntropicProviderToolRunInput(toolName, input)")) {
-	source = source.replace(marker, `const beforeHookWrapped = isToolWrappedWithBeforeToolCallHook(tool);
+	);
+	source = source.replace(
+		`function splitSdkTools(options) {
+\tconst { tools } = options;
+\treturn { customTools: toToolDefinitions(tools) };
+}`,
+		`function splitSdkTools(options) {
+\tconst { tools } = options;
+\tconst definitions = toToolDefinitions(tools);
+\treturn {
+\t\tbuiltInTools: [],
+\t\tcustomTools: definitions
+\t};
+}`
+	);
+	if (source !== before && source.includes("function splitSdkTools(options)") && source.includes("customTools: definitions")) splitPatchCount++;
+
+	if (source.includes("function toToolDefinitions(tools)") && !source.includes("function normalizeEntropicProviderToolRunInput(toolName, input)")) {
+		const marker = "const beforeHookWrapped = isToolWrappedWithBeforeToolCallHook(tool);";
+		source = source.replace(marker, `const beforeHookWrapped = isToolWrappedWithBeforeToolCallHook(tool);
 \t\tconst runProviderTool = async (input) => {
-\t\t\tconst toolCallId = "run_" + randomUUID();
+\t\t\tconst toolCallId = "run_" + Date.now().toString(36);
 \t\t\tconst normalizedInput = normalizeEntropicProviderToolRunInput(name, input);
 \t\t\tlet executeParams = normalizedInput;
 \t\t\ttry {
@@ -278,32 +365,27 @@ if (!source.includes("function normalizeEntropicProviderToolRunInput(toolName, i
 \t\t\t\t});
 \t\t\t}
 \t\t};`);
-	source = source.replace(
-		"execute: async (...args) => {",
-		"run: runProviderTool,\n\t\t\texecute: async (...args) => {"
-	);
-	source = source.replace(
-		"//#endregion\n//#region src/agents/session-file-repair.ts",
-		`function normalizeEntropicProviderToolRunInput(toolName, input) {
+		source = source.replace(
+			"execute: async (...args) => {",
+			"run: runProviderTool,\n\t\t\texecute: async (...args) => {"
+		);
+		source = source.replace(
+			"function toClientToolDefinitions(tools, onClientToolCall, hookContext) {",
+			`function normalizeEntropicProviderToolRunInput(toolName, input) {
 \tif (toolName === "browser" && typeof input === "string") {
 \t\tconst trimmed = input.trim();
 \t\tif (/^https?:\\/\\//i.test(trimmed)) return { action: "open", url: trimmed };
 \t}
 \treturn coerceParamsRecord(input);
 }
-//#endregion
-//#region src/agents/session-file-repair.ts`
-	);
+function toClientToolDefinitions(tools, onClientToolCall, hookContext) {`
+		);
+		if (source.includes("run: runProviderTool") && source.includes("function normalizeEntropicProviderToolRunInput(toolName, input)")) runPatchCount++;
+	}
+	if (source !== before) fs.writeFileSync(filePath, source);
 }
-for (const required of [
-	"builtInTools: []",
-	"customTools: definitions",
-	"run: runProviderTool",
-	"function normalizeEntropicProviderToolRunInput(toolName, input)"
-]) {
-	if (!source.includes(required)) throw new Error(`Provider tool run compatibility patch missed: ${required}`);
-}
-fs.writeFileSync(filePath, source);
+if (splitPatchCount === 0) throw new Error("Provider tool split compatibility patch did not match any dist file");
+if (runPatchCount === 0) throw new Error("Provider tool run compatibility patch did not match any dist file");
 NODE
 
 RUN node <<'NODE'
@@ -311,15 +393,16 @@ const fs = require("fs");
 const path = require("path");
 
 const distDir = "/app/dist";
-const contextFile = fs.readdirSync(distDir).find((file) => /^model-context-tokens-.*\.js$/.test(file));
-if (!contextFile) throw new Error("model-context-tokens bundle not found");
-const filePath = path.join(distDir, contextFile);
-let source = fs.readFileSync(filePath, "utf8");
-
-if (!source.includes("function stripEntropicAudioTranscriptPayloads(messages)")) {
-	source = source.replace(
-		"function estimateMessageChars$1(msg) {",
-		`function isEntropicAudioContentBlock(block) {
+function walkJs(dir) {
+	const out = [];
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) out.push(...walkJs(full));
+		else if (entry.isFile() && entry.name.endsWith(".js")) out.push(full);
+	}
+	return out;
+}
+const audioHelpers = `function isEntropicAudioContentBlock(block) {
 \treturn !!block && typeof block === "object" && (block.type === "audio" || block.type === "input_audio");
 }
 function stripEntropicAudioTranscriptPayloads(messages) {
@@ -344,25 +427,47 @@ function stripEntropicAudioTranscriptPayloads(messages) {
 \t}
 \treturn changed ? stripped : messages;
 }
-function estimateMessageChars$1(msg) {`
-	);
-	source = source.replaceAll(
+`;
+let stripPatchCount = 0;
+let estimatePatchCount = 0;
+for (const filePath of walkJs(distDir)) {
+	let source = fs.readFileSync(filePath, "utf8");
+	const before = source;
+	if (source.includes("const withInterSessionMarkers = annotateInterSessionUserMessages(params.messages);")) {
+		if (!source.includes("function stripEntropicAudioTranscriptPayloads(messages)")) {
+			const marker = source.includes("function estimateMessageChars(message) {")
+				? "function estimateMessageChars(message) {"
+				: "function estimateMessageChars(msg) {";
+			source = source.replace(marker, `${audioHelpers}${marker}`);
+		}
+		source = source.replace(
+			"const withInterSessionMarkers = annotateInterSessionUserMessages(params.messages);",
+			"const withInterSessionMarkers = annotateInterSessionUserMessages(stripEntropicAudioTranscriptPayloads(params.messages));"
+		);
+	}
+	if (source.includes("else chars += estimateUnknownChars(block);")) {
+		if (!source.includes("function isEntropicAudioContentBlock(block)")) {
+			const marker = source.includes("function estimateContentBlockChars(content) {")
+				? "function estimateContentBlockChars(content) {"
+				: "function estimateMessageChars(msg) {";
+			source = source.replace(marker, `function isEntropicAudioContentBlock(block) {
+\treturn !!block && typeof block === "object" && (block.type === "audio" || block.type === "input_audio");
+}
+${marker}`);
+		}
+		source = source.replaceAll(
 		"else chars += estimateUnknownChars(block);",
 		"else if (isEntropicAudioContentBlock(block)) chars += 128;\n\t\telse chars += estimateUnknownChars(block);"
 	);
-	source = source.replace(
-		"const withInterSessionMarkers = annotateInterSessionUserMessages(params.messages);",
-		"const withInterSessionMarkers = annotateInterSessionUserMessages(stripEntropicAudioTranscriptPayloads(params.messages));"
-	);
+	}
+	if (source !== before) {
+		if (source.includes("stripEntropicAudioTranscriptPayloads(params.messages)")) stripPatchCount++;
+		if (source.includes("isEntropicAudioContentBlock(block)) chars += 128")) estimatePatchCount++;
+		fs.writeFileSync(filePath, source);
+	}
 }
-for (const required of [
-	"function stripEntropicAudioTranscriptPayloads(messages)",
-	"if (message.role === \"assistant\" && /^Audio reply$/i.test(visibleText)) continue;",
-	"stripEntropicAudioTranscriptPayloads(params.messages)"
-]) {
-	if (!source.includes(required)) throw new Error(`Audio transcript replay sanitization patch missed: ${required}`);
-}
-fs.writeFileSync(filePath, source);
+if (stripPatchCount === 0) throw new Error("Audio transcript replay sanitization patch did not match any dist file");
+if (estimatePatchCount === 0) throw new Error("Audio transcript estimate sanitization patch did not match any dist file");
 NODE
 
 RUN node <<'NODE'
@@ -370,23 +475,33 @@ const fs = require("fs");
 const path = require("path");
 
 const distDir = "/app/dist";
-const runnerFile = fs.readdirSync(distDir).find((file) => /^pi-embedded-runner-.*\.js$/.test(file));
-if (!runnerFile) throw new Error("pi-embedded-runner bundle not found");
-const filePath = path.join(distDir, runnerFile);
-let source = fs.readFileSync(filePath, "utf8");
-const before = source;
-source = source.replace(
-	/\n(\t+)tools: builtInTools,\n\1customTools: allCustomTools,/g,
-	"\n$1...(builtInTools.length > 0 ? { tools: builtInTools } : {}),\n$1customTools: allCustomTools,"
-);
-if (source === before) throw new Error("Embedded runner createAgentSession tool allow-list call site not found");
-for (const required of [
-	"...(builtInTools.length > 0 ? { tools: builtInTools } : {})",
-	"const allCustomTools = [...customTools, ...clientToolDefs];"
-]) {
-	if (!source.includes(required)) throw new Error(`Embedded runner tool allow-list compatibility patch missed: ${required}`);
+function walkJs(dir) {
+	const out = [];
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		const full = path.join(dir, entry.name);
+		if (entry.isDirectory()) out.push(...walkJs(full));
+		else if (entry.isFile() && entry.name.endsWith(".js")) out.push(full);
+	}
+	return out;
 }
-fs.writeFileSync(filePath, source);
+let patchCount = 0;
+let modernAllowlistCount = 0;
+for (const filePath of walkJs(distDir)) {
+	let source = fs.readFileSync(filePath, "utf8");
+	const before = source;
+	source = source.replace(
+		/\n(\t+)tools: builtInTools,\n\1customTools: allCustomTools,/g,
+		"\n$1...(builtInTools.length > 0 ? { tools: builtInTools } : {}),\n$1customTools: allCustomTools,"
+	);
+	if (source !== before) {
+		patchCount++;
+		fs.writeFileSync(filePath, source);
+	}
+	if (source.includes("tools: sessionToolAllowlist") && source.includes("customTools: allCustomTools")) modernAllowlistCount++;
+}
+if (patchCount === 0 && modernAllowlistCount === 0) {
+	throw new Error("Embedded runner createAgentSession tool allow-list call site not found");
+}
 NODE
 
 RUN chmod +x /app/browser-service/office_tools.py && \

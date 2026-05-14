@@ -176,6 +176,82 @@ if [ ! -d "$OPENCLAW_SOURCE/dist" ]; then
     exit 1
 fi
 
+validate_openclaw_dist_freshness() {
+    python3 - <<'PY' "$OPENCLAW_SOURCE"
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+checks = [
+    (
+        root / "extensions" / "entropic-integrations",
+        root / "dist" / "extensions" / "entropic-integrations" / "index.js",
+    ),
+]
+stale = []
+for source_dir, dist_file in checks:
+    if not source_dir.exists():
+        continue
+    if not dist_file.exists():
+        stale.append(f"{dist_file} is missing")
+        continue
+    source_files = [
+        path
+        for path in source_dir.rglob("*")
+        if path.is_file() and "node_modules" not in path.parts and ".git" not in path.parts
+    ]
+    newest_source = max((path.stat().st_mtime for path in source_files), default=0)
+    if newest_source > dist_file.stat().st_mtime + 1:
+        stale.append(f"{dist_file} is older than {source_dir}")
+
+if stale:
+    print("ERROR: OpenClaw dist is stale:")
+    for item in stale:
+        print(f"  - {item}")
+    sys.exit(2)
+PY
+}
+
+if ! validate_openclaw_dist_freshness; then
+    if [ "${ENTROPIC_AUTO_BUILD_OPENCLAW_DIST:-1}" = "1" ]; then
+        echo "Rebuilding OpenClaw dist because bundled plugin source is newer..."
+        (cd "$OPENCLAW_SOURCE" && pnpm build:docker)
+        validate_openclaw_dist_freshness
+    else
+        echo "Run: cd $OPENCLAW_SOURCE && pnpm build:docker"
+        echo "Or set ENTROPIC_AUTO_BUILD_OPENCLAW_DIST=1 to let this script do it."
+        exit 1
+    fi
+fi
+
+verify_bundled_plugin_contracts() {
+    python3 - <<'PY' "$STAGING_DIR"
+import json
+import pathlib
+import sys
+
+staging = pathlib.Path(sys.argv[1])
+missing = []
+for manifest in sorted((staging / "extensions").glob("*/openclaw.plugin.json")):
+    plugin_id = manifest.parent.name
+    dist_file = staging / "dist" / "extensions" / plugin_id / "index.js"
+    if not dist_file.exists():
+        continue
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    tools = data.get("contracts", {}).get("tools", [])
+    source = dist_file.read_text(encoding="utf-8", errors="ignore")
+    for tool in tools:
+        if isinstance(tool, str) and tool not in source:
+            missing.append(f"{plugin_id}: contract tool {tool!r} is not present in {dist_file}")
+
+if missing:
+    print("ERROR: Bundled plugin contract/dist mismatch:")
+    for item in missing:
+        print(f"  - {item}")
+    sys.exit(2)
+PY
+}
+
 BUILD_ROOT="${ENTROPIC_BUILD_ROOT:-$(default_build_root)}"
 STAGING_DIR="$BUILD_ROOT/openclaw-runtime"
 mkdir -p "$STAGING_DIR"
@@ -290,6 +366,7 @@ fi
 
 normalize_tree_permissions "$STAGING_DIR/extensions"
 normalize_tree_permissions "$STAGING_DIR/bundled-skills"
+verify_bundled_plugin_contracts
 
 # Materialize production-only node_modules for runtime packaging.
 # Prefer pnpm deploy for deterministic prod dependency closure. If that fails
