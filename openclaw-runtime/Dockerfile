@@ -134,214 +134,6 @@ RUN PI_CODING_INDEX="/app/node_modules/@mariozechner/pi-coding-agent/dist/index.
       printf '\n// Legacy Entropic compatibility exports.\nimport { createCodingTools as __entropicCreateCodingTools, createReadTool as __entropicCreateReadTool } from "./core/sdk.js";\nexport const codingTools = __entropicCreateCodingTools(process.cwd());\nexport const readTool = __entropicCreateReadTool(process.cwd());\n' >> "$PI_CODING_INDEX"; \
     fi
 
-# Some OpenAI-compatible provider paths can return a visible XML/JSON tool-call
-# transcript even when tools were advertised. Recover that into an actual pi-ai
-# toolCall block so OpenClaw executes the tool instead of showing raw syntax.
-RUN node <<'NODE'
-const fs = require("fs");
-const path = require("path");
-
-const distDir = "/app/dist";
-const runner = fs.readdirSync(distDir).find((file) => /^pi-embedded-runner-.*\.js$/.test(file));
-if (!runner) throw new Error("pi-embedded-runner bundle not found");
-const filePath = path.join(distDir, runner);
-let source = fs.readFileSync(filePath, "utf8");
-const existingHelperStart = source.indexOf("// Entropic raw text tool-call recovery.");
-if (existingHelperStart >= 0) {
-  const existingHelperEnd = source.indexOf("function wrapStreamFnTrimToolCallNames(baseFn, allowedToolNames) {", existingHelperStart);
-  if (existingHelperEnd < 0) throw new Error("Existing Entropic helper end marker not found");
-  source = source.slice(0, existingHelperStart) + source.slice(existingHelperEnd);
-}
-const helper = String.raw`
-// Entropic raw text tool-call recovery.
-function parseEntropicRawTextToolCalls(text, allowedToolNames) {
-	const calls = [];
-	if (typeof text !== "string" || !/<tool_call/i.test(text)) return calls;
-	const blockRe = /<tool_call>\s*({[\s\S]*?})\s*<\/tool_call>/gi;
-	let match;
-	let index = 0;
-	while ((match = blockRe.exec(text))) {
-		try {
-			const parsed = JSON.parse(match[1]);
-			const rawName = typeof parsed?.name === "string" ? parsed.name : typeof parsed?.function?.name === "string" ? parsed.function.name : "";
-			const name = resolveExactAllowedToolName(rawName, allowedToolNames);
-			if (!name) continue;
-			const args = parsed?.arguments ?? parsed?.function?.arguments ?? {};
-			const normalizedArgs = typeof args === "string" ? JSON.parse(args || "{}") : args && typeof args === "object" ? args : {};
-			calls.push({
-				type: "toolCall",
-				id: "call_entropic_raw_" + ++index,
-				name,
-				arguments: normalizedArgs
-			});
-		} catch {}
-	}
-	return calls;
-}
-function recoverEntropicRawTextToolCallsInMessage(message, allowedToolNames) {
-	if (!message || typeof message !== "object" || !Array.isArray(message.content)) return false;
-	const textBlocks = message.content.filter((block) => block && typeof block === "object" && block.type === "text" && typeof block.text === "string");
-	const rawText = textBlocks.map((block) => block.text).join("\n");
-	const calls = parseEntropicRawTextToolCalls(rawText, allowedToolNames);
-	if (calls.length === 0) return false;
-	const cleanedText = rawText.replace(/<tool_call>\s*{[\s\S]*?}\s*<\/tool_call>/gi, "").trim();
-	const nextContent = [];
-	if (cleanedText && !/couldn['’]t execute|could not execute|can['’]t reliably|without risking a stale answer/i.test(cleanedText)) {
-		nextContent.push({ type: "text", text: cleanedText });
-	}
-	nextContent.push(...calls);
-	message.content = nextContent;
-	message.stopReason = "toolUse";
-	return true;
-}
-function wrapStreamFnRecoverEntropicRawTextToolCalls(baseFn, allowedToolNames) {
-	return (model, context, options) => {
-		const maybeStream = baseFn(model, context, options);
-		const wrap = (stream) => {
-			if (!stream || typeof stream !== "object") return stream;
-			const originalResult = typeof stream.result === "function" ? stream.result.bind(stream) : null;
-			if (originalResult) {
-				stream.result = async () => {
-					const message = await originalResult();
-					recoverEntropicRawTextToolCallsInMessage(message, allowedToolNames);
-					return message;
-				};
-			}
-			const originalIterator = typeof stream[Symbol.asyncIterator] === "function" ? stream[Symbol.asyncIterator].bind(stream) : null;
-			if (originalIterator) {
-				stream[Symbol.asyncIterator] = function() {
-					const iterator = originalIterator();
-					return {
-						async next() {
-							const result = await iterator.next();
-							if (!result.done && result.value && typeof result.value === "object") {
-								recoverEntropicRawTextToolCallsInMessage(result.value.partial, allowedToolNames);
-								recoverEntropicRawTextToolCallsInMessage(result.value.message, allowedToolNames);
-							}
-							return result;
-						},
-						async return(value) {
-							return iterator.return?.(value) ?? { done: true, value };
-						},
-						async throw(error) {
-							return iterator.throw?.(error) ?? Promise.reject(error);
-						}
-					};
-				};
-			}
-			return stream;
-		};
-		if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) return Promise.resolve(maybeStream).then(wrap);
-		return wrap(maybeStream);
-	};
-}
-function entropicContextLatestUserText(context) {
-	const messages = Array.isArray(context?.messages) ? context.messages : [];
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (!message || typeof message !== "object" || message.role !== "user") continue;
-		const content = message.content;
-		if (typeof content === "string") return content;
-		if (Array.isArray(content)) {
-			return content.map((block) => block && typeof block === "object" && block.type === "text" ? block.text || "" : "").join("\n");
-		}
-	}
-	return "";
-}
-function entropicLatestUserIndex(context) {
-	const messages = Array.isArray(context?.messages) ? context.messages : [];
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (message && typeof message === "object" && message.role === "user") return i;
-	}
-	return -1;
-}
-function entropicMessageHasBrowserToolUse(message) {
-	const content = Array.isArray(message?.content) ? message.content : [];
-	return content.some((block) => block && typeof block === "object" && block.type === "toolCall" && block.name === "browser");
-}
-function entropicBrowserToolAlreadyUsedAfterLatestUser(context) {
-	const messages = Array.isArray(context?.messages) ? context.messages : [];
-	const latestUserIndex = entropicLatestUserIndex(context);
-	if (latestUserIndex < 0) return false;
-	return messages.slice(latestUserIndex + 1).some(entropicMessageHasBrowserToolUse);
-}
-function hasEntropicAllowedTool(allowedToolNames, name) {
-	if (allowedToolNames?.has?.(name)) return true;
-	if (Array.isArray(allowedToolNames)) return allowedToolNames.includes(name);
-	return false;
-}
-function shouldEntropicForceBrowserTool(context, allowedToolNames) {
-	if (!hasEntropicAllowedTool(allowedToolNames, "browser")) return false;
-	if (entropicBrowserToolAlreadyUsedAfterLatestUser(context)) return false;
-	const text = entropicContextLatestUserText(context).toLowerCase();
-	if (!text) return false;
-	if (/\b(weather|temperature|forecast|rain|storm|humidity|wind|air quality|aqi)\b/.test(text)) return true;
-	if (/\b(stock|stocks|market|markets|s&p|sp500|nasdaq|dow|price|prices|quote|closed|close today)\b/.test(text)) return true;
-	if (/\b(news|latest|current|right now|today|tonight|tomorrow|live|lookup|look up|web|internet)\b/.test(text)) return true;
-	return false;
-}
-function entropicBrowserUrlForCurrentInfo(context) {
-	const rawText = entropicContextLatestUserText(context).replace(/Sender \(untrusted metadata\):[\s\S]*?\]\s*/m, "").trim();
-	const query = rawText || "current information";
-	return "https://www.google.com/search?q=" + encodeURIComponent(query);
-}
-function createEntropicSyntheticBrowserToolResponse(model, context) {
-	const message = {
-		role: "assistant",
-		content: [{
-			type: "toolCall",
-			id: "call_entropic_browser_current_info",
-			name: "browser",
-			arguments: {
-				action: "open",
-				url: entropicBrowserUrlForCurrentInfo(context)
-			}
-		}],
-		stopReason: "toolUse",
-		api: model?.api ?? "",
-		provider: model?.provider ?? "",
-		model: model?.id ?? "",
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				total: 0
-			}
-		},
-		timestamp: Date.now()
-	};
-	return {
-		async *[Symbol.asyncIterator]() {},
-		result: async () => message
-	};
-}
-function wrapStreamFnForceBrowserForCurrentInfo(baseFn, allowedToolNames) {
-	return (model, context, options) => {
-		if (shouldEntropicForceBrowserTool(context, allowedToolNames)) {
-			return createEntropicSyntheticBrowserToolResponse(model, context);
-		}
-		return baseFn(model, context, options);
-	};
-}
-`;
-source = source.replace("function wrapStreamFnTrimToolCallNames(baseFn, allowedToolNames) {", `${helper}\nfunction wrapStreamFnTrimToolCallNames(baseFn, allowedToolNames) {`);
-if (!source.includes("wrapStreamFnForceBrowserForCurrentInfo(activeSession.agent.streamFn, allowedToolNames)")) {
-  source = source.replace(
-    "activeSession.agent.streamFn = wrapStreamFnSanitizeMalformedToolCalls(activeSession.agent.streamFn, allowedToolNames, transcriptPolicy);",
-    "activeSession.agent.streamFn = wrapStreamFnSanitizeMalformedToolCalls(activeSession.agent.streamFn, allowedToolNames, transcriptPolicy);\n\t\t\tactiveSession.agent.streamFn = wrapStreamFnForceBrowserForCurrentInfo(activeSession.agent.streamFn, allowedToolNames);\n\t\t\tactiveSession.agent.streamFn = wrapStreamFnRecoverEntropicRawTextToolCalls(activeSession.agent.streamFn, allowedToolNames);"
-  );
-}
-fs.writeFileSync(filePath, source);
-NODE
-
 # Venice/OpenRouter rejects OpenAI-compatible completion requests with an empty
 # tools array. OpenClaw can create tool-history turns for client-side tools such
 # as browser, so omit the field instead of sending `tools: []`.
@@ -358,6 +150,183 @@ source = source.replace(
 	"} else if (hasToolHistory(context.messages)) params.tools = [];",
 	"}"
 );
+source = source.replace(
+	"if (context.tools) params.tools = convertAnthropicTools(context.tools, isOAuthToken);",
+	"if (context.tools?.length) params.tools = convertAnthropicTools(context.tools, isOAuthToken);"
+);
+source = source.replace(
+	"if (context.tools) params.tools = convertResponsesTools(context.tools, { strict: resolveOpenAIStrictToolSetting(model, { transport: \"stream\" }) });",
+	"if (context.tools?.length) params.tools = convertResponsesTools(context.tools, { strict: resolveOpenAIStrictToolSetting(model, { transport: \"stream\" }) });"
+);
+source = source.replace(
+	"if (context.tools) {\n\t\tparams.tools = convertTools(context.tools, compat, model);",
+	"if (context.tools?.length) {\n\t\tparams.tools = convertTools(context.tools, compat, model);"
+);
+source = source.replace(
+	`function convertTools(tools, compat, model) {
+\tconst strict = resolveOpenAIStrictToolFlagForInventory(tools, resolveOpenAIStrictToolSetting(model, {
+\t\ttransport: "stream",
+\t\tsupportsStrictMode: compat?.supportsStrictMode
+\t}));
+\treturn tools.map((tool) => ({
+\t\ttype: "function",
+\t\tfunction: {
+\t\t\tname: tool.name,
+\t\t\tdescription: tool.description,
+\t\t\tparameters: normalizeOpenAIStrictToolParameters(tool.parameters, strict === true),
+\t\t\t...strict === void 0 ? {} : { strict }
+\t\t}
+\t}));
+}`,
+	`function convertTools(tools, compat, model) {
+\tconst strict = resolveOpenAIStrictToolFlagForInventory(tools, resolveOpenAIStrictToolSetting(model, {
+\t\ttransport: "stream",
+\t\tsupportsStrictMode: compat?.supportsStrictMode
+\t}));
+\treturn tools.map((tool) => {
+\t\tconst converted = {
+\t\t\ttype: "function",
+\t\t\tfunction: {
+\t\t\t\tname: tool.name,
+\t\t\t\tdescription: tool.description,
+\t\t\t\tparameters: normalizeOpenAIStrictToolParameters(tool.parameters, strict === true),
+\t\t\t\t...strict === void 0 ? {} : { strict }
+\t\t\t}
+\t\t};
+\t\tObject.defineProperty(converted, "name", { value: tool.name });
+\t\tObject.defineProperty(converted, "run", {
+\t\t\tvalue: async (input) => {
+\t\t\t\tif (typeof tool.run === "function") return await tool.run(input);
+\t\t\t\tif (typeof tool.execute === "function") return await tool.execute("run_" + randomUUID(), input);
+\t\t\t\tthrow new Error("Tool has no executable handler");
+\t\t\t}
+\t\t});
+\t\treturn converted;
+\t});
+}`
+);
+for (const forbidden of [
+	"} else if (hasToolHistory(context.messages)) params.tools = [];",
+	"if (context.tools) params.tools = convertAnthropicTools(context.tools, isOAuthToken);",
+	"if (context.tools) params.tools = convertResponsesTools(context.tools, { strict: resolveOpenAIStrictToolSetting(model, { transport: \"stream\" }) });",
+	"if (context.tools) {\n\t\tparams.tools = convertTools(context.tools, compat, model);"
+]) {
+	if (source.includes(forbidden)) throw new Error(`Venice empty-tools compatibility patch missed: ${forbidden}`);
+}
+for (const required of [
+	"Object.defineProperty(converted, \"name\"",
+	"Object.defineProperty(converted, \"run\""
+]) {
+	if (!source.includes(required)) throw new Error(`Venice OpenAI tool runner compatibility patch missed: ${required}`);
+}
+fs.writeFileSync(filePath, source);
+NODE
+
+RUN node <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const distDir = "/app/dist";
+const contextFile = fs.readdirSync(distDir).find((file) => /^model-context-tokens-.*\.js$/.test(file));
+if (!contextFile) throw new Error("model-context-tokens bundle not found");
+const filePath = path.join(distDir, contextFile);
+let source = fs.readFileSync(filePath, "utf8");
+source = source.replace(
+	`function splitSdkTools(options) {
+\tconst { tools } = options;
+\treturn {
+\t\tbuiltInTools: [],
+\t\tcustomTools: toToolDefinitions(tools)
+\t};
+}`,
+	`function splitSdkTools(options) {
+\tconst { tools } = options;
+\tconst definitions = toToolDefinitions(tools);
+\treturn {
+\t\tbuiltInTools: [],
+\t\tcustomTools: definitions
+\t};
+}`
+);
+const marker = "const beforeHookWrapped = isToolWrappedWithBeforeToolCallHook(tool);";
+if (!source.includes("function normalizeEntropicProviderToolRunInput(toolName, input)")) {
+	source = source.replace(marker, `const beforeHookWrapped = isToolWrappedWithBeforeToolCallHook(tool);
+\t\tconst runProviderTool = async (input) => {
+\t\t\tconst toolCallId = "run_" + randomUUID();
+\t\t\tconst normalizedInput = normalizeEntropicProviderToolRunInput(name, input);
+\t\t\tlet executeParams = normalizedInput;
+\t\t\ttry {
+\t\t\t\tif (!beforeHookWrapped) {
+\t\t\t\t\tconst hookOutcome = await runBeforeToolCallHook({
+\t\t\t\t\t\ttoolName: name,
+\t\t\t\t\t\tparams: normalizedInput,
+\t\t\t\t\t\ttoolCallId
+\t\t\t\t\t});
+\t\t\t\t\tif (hookOutcome.blocked) throw new Error(hookOutcome.reason);
+\t\t\t\t\texecuteParams = hookOutcome.params;
+\t\t\t\t}
+\t\t\t\treturn normalizeToolExecutionResult({
+\t\t\t\t\ttoolName: normalizedName,
+\t\t\t\t\tresult: await tool.execute(toolCallId, executeParams)
+\t\t\t\t});
+\t\t\t} catch (err) {
+\t\t\t\tconst described = describeToolExecutionError(err);
+\t\t\t\tlogError(\`[tools] \${normalizedName} failed: \${described.message}\`);
+\t\t\t\treturn buildToolExecutionErrorResult({
+\t\t\t\t\ttoolName: normalizedName,
+\t\t\t\t\tmessage: described.message
+\t\t\t\t});
+\t\t\t}
+\t\t};`);
+	source = source.replace(
+		"execute: async (...args) => {",
+		"run: runProviderTool,\n\t\t\texecute: async (...args) => {"
+	);
+	source = source.replace(
+		"//#endregion\n//#region src/agents/session-file-repair.ts",
+		`function normalizeEntropicProviderToolRunInput(toolName, input) {
+\tif (toolName === "browser" && typeof input === "string") {
+\t\tconst trimmed = input.trim();
+\t\tif (/^https?:\\/\\//i.test(trimmed)) return { action: "open", url: trimmed };
+\t}
+\treturn coerceParamsRecord(input);
+}
+//#endregion
+//#region src/agents/session-file-repair.ts`
+	);
+}
+for (const required of [
+	"builtInTools: []",
+	"customTools: definitions",
+	"run: runProviderTool",
+	"function normalizeEntropicProviderToolRunInput(toolName, input)"
+]) {
+	if (!source.includes(required)) throw new Error(`Provider tool run compatibility patch missed: ${required}`);
+}
+fs.writeFileSync(filePath, source);
+NODE
+
+RUN node <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const distDir = "/app/dist";
+const runnerFile = fs.readdirSync(distDir).find((file) => /^pi-embedded-runner-.*\.js$/.test(file));
+if (!runnerFile) throw new Error("pi-embedded-runner bundle not found");
+const filePath = path.join(distDir, runnerFile);
+let source = fs.readFileSync(filePath, "utf8");
+const before = source;
+source = source.replace(
+	/\n(\t+)tools: builtInTools,\n\1customTools: allCustomTools,/g,
+	"\n$1...(builtInTools.length > 0 ? { tools: builtInTools } : {}),\n$1customTools: allCustomTools,"
+);
+if (source === before) throw new Error("Embedded runner createAgentSession tool allow-list call site not found");
+for (const required of [
+	"...(builtInTools.length > 0 ? { tools: builtInTools } : {})",
+	"const allCustomTools = [...customTools, ...clientToolDefs];"
+]) {
+	if (!source.includes(required)) throw new Error(`Embedded runner tool allow-list compatibility patch missed: ${required}`);
+}
 fs.writeFileSync(filePath, source);
 NODE
 

@@ -48,7 +48,6 @@ const MODEL_PRICING: Record<string, ModelPricing> = {
   "openrouter/free": { input: 5, output: 5 },
   "venice/kimi-k2-6": { input: 102, output: 560 },
   "venice/claude-opus-4-7": { input: 720, output: 3600 },
-  "venice/openai-gpt-55": { input: 750, output: 4500 },
   "venice/deepseek-v3.2": { input: 40, output: 58 },
   "venice/zai-org-glm-4.7-flash": { input: 16, output: 60 },
   "venice/olafangensan-glm-4.7-flash-heretic": { input: 17, output: 96 },

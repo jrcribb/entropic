@@ -11243,7 +11243,7 @@ Use it for durable decisions, preferences, and facts that should persist across 
     }
 
     remove_openclaw_config_value(&mut cfg, &["plugins", "entries", "browser"]);
-    if container_plugin_exists("browser") {
+    if container_loadable_gateway_plugin_exists("browser") {
         set_openclaw_config_value(
             &mut cfg,
             &["plugins", "entries", "browser", "enabled"],
@@ -11895,7 +11895,13 @@ fn normalize_openclaw_config(cfg: &mut serde_json::Value) {
     append_unique_openclaw_config_array_strings(
         cfg,
         &["tools", "deny"],
-        &["file_write", "file_fetch", "dir_list", "dir_fetch", "web_fetch"],
+        &[
+            "file_write",
+            "file_fetch",
+            "dir_list",
+            "dir_fetch",
+            "web_fetch",
+        ],
     );
     for skill_id in DISABLED_NATIVE_SKILL_IDS {
         set_openclaw_config_value(
